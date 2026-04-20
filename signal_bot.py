@@ -1,24 +1,22 @@
-# XauBot Signal Bot - Railway / MetaAPI
+# XauBot Signal Bot - Railway / yfinance
 # Signaux XAUUSD + US100 sur M5
 
 import asyncio
 import logging
 import os
 import pandas as pd
+import yfinance as yf
 from datetime import datetime
 from telegram import Bot
-from telegram.constants import ParseMode
-from metaapi_cloud_sdk import MetaApi
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-METAAPI_TOKEN    = os.environ["METAAPI_TOKEN"]
-METAAPI_ACCOUNT  = os.environ["METAAPI_ACCOUNT"]
 
 SCAN_INTERVAL = 300
 
 XAUUSD_CONFIG = {
-    "symbol"    : "XAUUSD",
+    "ticker"    : "GC=F",
+    "label"     : "XAUUSD",
     "ema_fast"  : 15,
     "ema_slow"  : 50,
     "adx_period": 14,
@@ -28,7 +26,8 @@ XAUUSD_CONFIG = {
 }
 
 US100_CONFIG = {
-    "symbol"    : "US100.cash",
+    "ticker"    : "NQ=F",
+    "label"     : "US100",
     "ema_fast"  : 20,
     "ema_slow"  : 50,
     "rsi_period": 14,
@@ -41,6 +40,17 @@ US100_CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
+def get_candles(ticker, period="2d", interval="5m"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close"})
+        df = df.dropna()
+        return df
+    except Exception as e:
+        log.error("get_candles " + ticker + ": " + str(e))
+        return None
+
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -52,7 +62,9 @@ def rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def adx(df, period=14):
-    high, low, close = df["high"], df["low"], df["close"]
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
     plus_dm  = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
     tr = pd.concat([
@@ -71,35 +83,20 @@ def double_impulse(df):
     bear = (df["close"].iloc[-2] < df["open"].iloc[-2]) and (df["close"].iloc[-3] < df["open"].iloc[-3])
     return bull, bear
 
-async def get_candles(connection, symbol, count=200):
-    try:
-        candles = await connection.get_historical_candles(symbol, "5m", count)
-        df = pd.DataFrame([{
-            "time" : c["time"],
-            "open" : c["open"],
-            "high" : c["high"],
-            "low"  : c["low"],
-            "close": c["close"]
-        } for c in candles])
-        return df
-    except Exception as e:
-        log.error("get_candles " + symbol + ": " + str(e))
-        return None
-
-async def analyze_xauusd(connection):
+def analyze_xauusd():
     cfg = XAUUSD_CONFIG
-    df  = await get_candles(connection, cfg["symbol"])
+    df  = get_candles(cfg["ticker"])
     if df is None or len(df) < 60:
         return None
     df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
     df["ema_slow"] = ema(df["close"], cfg["ema_slow"])
     adx_s, plus_di, minus_di = adx(df, cfg["adx_period"])
-    price     = df["close"].iloc[-1]
-    ema_f     = df["ema_fast"].iloc[-1]
-    ema_s     = df["ema_slow"].iloc[-1]
-    adx_now   = adx_s.iloc[-1]
-    plus_now  = plus_di.iloc[-1]
-    minus_now = minus_di.iloc[-1]
+    price     = round(float(df["close"].iloc[-1]), 2)
+    ema_f     = float(df["ema_fast"].iloc[-1])
+    ema_s     = float(df["ema_slow"].iloc[-1])
+    adx_now   = float(adx_s.iloc[-1])
+    plus_now  = float(plus_di.iloc[-1])
+    minus_now = float(minus_di.iloc[-1])
     bull_imp, bear_imp = double_impulse(df)
     adx_ok = adx_now > cfg["adx_min"]
     if ema_f > ema_s and plus_now > minus_now and adx_ok and bull_imp:
@@ -108,70 +105,79 @@ async def analyze_xauusd(connection):
         return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(adx_now, 1), "ADX")
     return None
 
-async def analyze_us100(connection):
+def analyze_us100():
     cfg = US100_CONFIG
-    df  = await get_candles(connection, cfg["symbol"])
+    df  = get_candles(cfg["ticker"])
     if df is None or len(df) < 60:
         return None
     df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
     df["ema_slow"] = ema(df["close"], cfg["ema_slow"])
     df["rsi"]      = rsi(df["close"], cfg["rsi_period"])
-    price    = df["close"].iloc[-1]
-    ema_f    = df["ema_fast"].iloc[-1]
-    ema_s    = df["ema_slow"].iloc[-1]
-    rsi_now  = df["rsi"].iloc[-1]
-    rsi_prev = df["rsi"].iloc[-2]
+    price    = round(float(df["close"].iloc[-1]), 2)
+    ema_f    = float(df["ema_fast"].iloc[-1])
+    ema_s    = float(df["ema_slow"].iloc[-1])
+    rsi_now  = float(df["rsi"].iloc[-1])
+    rsi_prev = float(df["rsi"].iloc[-2])
     if ema_f > ema_s and rsi_prev < cfg["rsi_os"] and rsi_now > cfg["rsi_os"]:
         return ("BUY",  price, round(price + cfg["tp_pts"], 2), round(price - cfg["sl_pts"], 2), round(rsi_now, 1), "RSI")
     if ema_f < ema_s and rsi_prev > cfg["rsi_ob"] and rsi_now < cfg["rsi_ob"]:
         return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(rsi_now, 1), "RSI")
     return None
 
-def format_message(symbol, direction, price, tp, sl, ind_val, ind_name):
-    emoji = "BUY" if direction == "BUY" else "SELL"
-    rr    = round(abs(tp - price) / abs(sl - price), 2)
-    now   = datetime.utcnow().strftime("%H:%M UTC")
-    msg   = emoji + " SIGNAL " + direction + " - " + symbol + "\n"
-    msg  += "Heure : " + now + "\n"
-    msg  += "Entry : " + str(price) + "\n"
-    msg  += "TP    : " + str(tp) + "\n"
-    msg  += "SL    : " + str(sl) + "\n"
-    msg  += "RR    : 1:" + str(rr) + "\n"
-    msg  += ind_name + "   : " + str(ind_val) + "\n"
-    msg  += "Signal indicatif - gerez votre risque"
+def format_message(label, direction, price, tp, sl, ind_val, ind_name):
+    rr  = round(abs(tp - price) / abs(sl - price), 2)
+    now = datetime.utcnow().strftime("%H:%M UTC")
+    arrow = "BUY" if direction == "BUY" else "SELL"
+    msg  = arrow + " SIGNAL " + direction + " - " + label + "\n"
+    msg += "Heure  : " + now + "\n"
+    msg += "Entry  : " + str(price) + "\n"
+    msg += "TP     : " + str(tp) + "\n"
+    msg += "SL     : " + str(sl) + "\n"
+    msg += "RR     : 1:" + str(rr) + "\n"
+    msg += ind_name + "    : " + str(ind_val) + "\n"
+    msg += "Signal indicatif - verifiez sur MT5"
     return msg
 
-last_signal = {"XAUUSD": None, "US100.cash": None}
+last_signal = {"XAUUSD": None, "US100": None}
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
-    api = MetaApi(METAAPI_TOKEN)
 
-    log.info("Connexion MetaAPI...")
-    account    = await api.metatrader_account_api.get_account(METAAPI_ACCOUNT)
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
-    log.info("MetaAPI connecte")
-
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="XauBot Signal demarre - Scan XAUUSD + US100 toutes les 5 min")
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text="XauBot Signal demarre - Scan XAUUSD + US100 toutes les 5 min"
+    )
+    log.info("Bot demarre")
 
     while True:
         try:
-            for analyze_fn, sym in [(analyze_xauusd, "XAUUSD"), (analyze_us100, "US100.cash")]:
-                result = await analyze_fn(connection)
-                if result:
-                    direction, price, tp, sl, ind, ind_name = result
-                    key = direction + "_" + str(round(price, 1))
-                    if last_signal[sym] != key:
-                        msg = format_message(sym, direction, price, tp, sl, ind, ind_name)
-                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-                        last_signal[sym] = key
-                        log.info("Signal " + sym + ": " + direction + " @ " + str(price))
-                else:
-                    last_signal[sym] = None
+            xau = analyze_xauusd()
+            if xau:
+                direction, price, tp, sl, ind, ind_name = xau
+                key = direction + "_" + str(round(price, 0))
+                if last_signal["XAUUSD"] != key:
+                    msg = format_message("XAUUSD", direction, price, tp, sl, ind, ind_name)
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                    last_signal["XAUUSD"] = key
+                    log.info("Signal XAUUSD: " + direction + " @ " + str(price))
+            else:
+                last_signal["XAUUSD"] = None
+
+            us = analyze_us100()
+            if us:
+                direction, price, tp, sl, ind, ind_name = us
+                key = direction + "_" + str(round(price, 0))
+                if last_signal["US100"] != key:
+                    msg = format_message("US100", direction, price, tp, sl, ind, ind_name)
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                    last_signal["US100"] = key
+                    log.info("Signal US100: " + direction + " @ " + str(price))
+            else:
+                last_signal["US100"] = None
+
         except Exception as e:
             log.error("Erreur scan: " + str(e))
+
         await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
