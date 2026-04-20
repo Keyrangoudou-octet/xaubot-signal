@@ -1,21 +1,22 @@
-# XauBot Signal Bot - Railway / yfinance
+# XauBot Signal Bot - Railway / Twelve Data
 # Signaux XAUUSD + US100 sur M5
 
 import asyncio
 import logging
 import os
+import requests
 import pandas as pd
-import yfinance as yf
 from datetime import datetime
 from telegram import Bot
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
 SCAN_INTERVAL = 300
 
 XAUUSD_CONFIG = {
-    "ticker"    : "GC=F",
+    "symbol"    : "XAU/USD",
     "label"     : "XAUUSD",
     "ema_fast"  : 15,
     "ema_slow"  : 50,
@@ -26,7 +27,7 @@ XAUUSD_CONFIG = {
 }
 
 US100_CONFIG = {
-    "ticker"    : "NQ=F",
+    "symbol"    : "NDX",
     "label"     : "US100",
     "ema_fast"  : 20,
     "ema_slow"  : 50,
@@ -40,15 +41,29 @@ US100_CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-def get_candles(ticker, period="2d", interval="5m"):
+def get_candles(symbol, interval="5min", outputsize=100):
     try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-        df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
-        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close"})
-        df = df.dropna()
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol"    : symbol,
+            "interval"  : interval,
+            "outputsize": outputsize,
+            "apikey"    : TWELVE_API_KEY,
+            "format"    : "JSON"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if "values" not in data:
+            log.error("Twelve Data erreur " + symbol + ": " + str(data.get("message", "unknown")))
+            return None
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "time"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col])
+        df = df.iloc[::-1].reset_index(drop=True)
         return df
     except Exception as e:
-        log.error("get_candles " + ticker + ": " + str(e))
+        log.error("get_candles " + symbol + ": " + str(e))
         return None
 
 def ema(series, period):
@@ -85,7 +100,7 @@ def double_impulse(df):
 
 def analyze_xauusd():
     cfg = XAUUSD_CONFIG
-    df  = get_candles(cfg["ticker"])
+    df  = get_candles(cfg["symbol"])
     if df is None or len(df) < 60:
         return None
     df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
@@ -107,7 +122,7 @@ def analyze_xauusd():
 
 def analyze_us100():
     cfg = US100_CONFIG
-    df  = get_candles(cfg["ticker"])
+    df  = get_candles(cfg["symbol"])
     if df is None or len(df) < 60:
         return None
     df["ema_fast"] = ema(df["close"], cfg["ema_fast"])
@@ -127,8 +142,7 @@ def analyze_us100():
 def format_message(label, direction, price, tp, sl, ind_val, ind_name):
     rr  = round(abs(tp - price) / abs(sl - price), 2)
     now = datetime.utcnow().strftime("%H:%M UTC")
-    arrow = "BUY" if direction == "BUY" else "SELL"
-    msg  = arrow + " SIGNAL " + direction + " - " + label + "\n"
+    msg  = direction + " SIGNAL - " + label + "\n"
     msg += "Heure  : " + now + "\n"
     msg += "Entry  : " + str(price) + "\n"
     msg += "TP     : " + str(tp) + "\n"
@@ -142,12 +156,11 @@ last_signal = {"XAUUSD": None, "US100": None}
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
-
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal demarre - Scan XAUUSD + US100 toutes les 5 min"
+        text="XauBot Signal demarre - Twelve Data - Scan XAUUSD + US100 toutes les 5 min"
     )
-    log.info("Bot demarre")
+    log.info("Bot demarre avec Twelve Data")
 
     while True:
         try:
@@ -162,6 +175,8 @@ async def main():
                     log.info("Signal XAUUSD: " + direction + " @ " + str(price))
             else:
                 last_signal["XAUUSD"] = None
+
+            await asyncio.sleep(5)
 
             us = analyze_us100()
             if us:
