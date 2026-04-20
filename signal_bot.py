@@ -1,12 +1,12 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# Signaux XAUUSD + US100 sur M5
+# Signaux XAUUSD + US100 sur M5 - Sessions Londres + New York uniquement
 
 import asyncio
 import logging
 import os
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Bot
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -14,6 +14,12 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
 SCAN_INTERVAL = 300
+
+# Sessions de trading (UTC)
+SESSION_LONDON_START  = 8
+SESSION_LONDON_END    = 17
+SESSION_NY_START      = 13
+SESSION_NY_END        = 22
 
 XAUUSD_CONFIG = {
     "symbol"    : "XAU/USD",
@@ -40,6 +46,16 @@ US100_CONFIG = {
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
+
+def is_market_open():
+    now_utc = datetime.now(timezone.utc)
+    # Pas de trading le weekend
+    if now_utc.weekday() >= 5:
+        return False
+    hour = now_utc.hour
+    in_london = SESSION_LONDON_START <= hour < SESSION_LONDON_END
+    in_ny     = SESSION_NY_START     <= hour < SESSION_NY_END
+    return in_london or in_ny
 
 def get_candles(symbol, interval="5min", outputsize=100):
     try:
@@ -158,12 +174,17 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal demarre - Twelve Data - Scan XAUUSD + US100 toutes les 5 min"
+        text="XauBot Signal demarre - Sessions Londres + New York uniquement (8h-22h UTC)"
     )
-    log.info("Bot demarre avec Twelve Data")
+    log.info("Bot demarre")
 
     while True:
         try:
+            if not is_market_open():
+                log.info("Marche ferme - attente")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+
             xau = analyze_xauusd()
             if xau:
                 direction, price, tp, sl, ind, ind_name = xau
