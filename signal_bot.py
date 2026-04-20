@@ -1,7 +1,4 @@
-“””
-XauBot - Signal Bot Telegram (Railway / MetaAPI)
-Signaux XAUUSD + US100 sur M5
-“””
+# XauBot Signal Bot
 
 import asyncio
 import logging
