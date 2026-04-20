@@ -1,7 +1,7 @@
-“””
+
 XauBot - Signal Bot Telegram (Railway / MetaAPI)
 Signaux XAUUSD + US100 sur M5
-“””
+
 
 import asyncio
 import logging
@@ -32,24 +32,24 @@ SCAN_INTERVAL = 300  # 5 minutes
 # ─────────────────────────────────────────────
 
 XAUUSD_CONFIG = {
-“symbol”    : “XAUUSD”,
-“ema_fast”  : 15,
-“ema_slow”  : 50,
-“adx_period”: 14,
-“adx_min”   : 20,
-“tp_pts”    : 1.5,
-“sl_pts”    : 1.0,
+"symbol”    : “XAUUSD”,
+"ema_fast”  : 15,
+"ema_slow”  : 50,
+"adx_period”: 14,
+"adx_min”   : 20,
+"tp_pts”    : 1.5,
+"sl_pts”    : 1.0,
 }
 
 US100_CONFIG = {
-“symbol”    : “US100.cash”,
-“ema_fast”  : 20,
-“ema_slow”  : 50,
-“rsi_period”: 14,
-“rsi_ob”    : 65,
-“rsi_os”    : 35,
-“tp_pts”    : 30,
-“sl_pts”    : 20,
+"symbol”    : “US100.cash”,
+"ema_fast”  : 20,
+"ema_slow”  : 50,
+"rsi_period”: 14,
+"rsi_ob”    : 65,
+"rsi_os”    : 35,
+"tp_pts”    : 30,
+"sl_pts”    : 20,
 }
 
 # ─────────────────────────────────────────────
@@ -165,16 +165,16 @@ emoji = “🟢” if direction == “BUY” else “🔴”
 rr    = round(abs(tp - price) / abs(sl - price), 2)
 now   = datetime.utcnow().strftime(”%H:%M UTC”)
 return (
-f”{emoji} *SIGNAL {direction} — {symbol}*\n”
-f”━━━━━━━━━━━━━━━━━━\n”
-f”⏰ *Heure :* `{now}`\n”
-f”💰 *Entry :* `{price}`\n”
-f”✅ *TP :* `{tp}`\n”
-f”🛑 *SL :* `{sl}`\n”
-f”📊 *RR :* `1:{rr}`\n”
-f”📈 *{ind_name} :* `{ind_val}`\n”
-f”━━━━━━━━━━━━━━━━━━\n”
-f”⚠️ *Signal indicatif — gérez votre risque*”
+f"{emoji} *SIGNAL {direction} — {symbol}*\n"
+f”━━━━━━━━━━━━━━━━━━\n"
+f"⏰ *Heure :* `{now}`\n"
+f"💰 *Entry :* `{price}`\n"
+f"✅ *TP :* `{tp}`\n"
+f"🛑 *SL :* `{sl}`\n"
+f"📊 *RR :* `1:{rr}`\n"
+f"📈 *{ind_name} :* `{ind_val}`\n"
+f"━━━━━━━━━━━━━━━━━━\n”
+f"⚠️ *Signal indicatif — gérez votre risque*"
 )
 
 # ─────────────────────────────────────────────
@@ -183,7 +183,7 @@ f”⚠️ *Signal indicatif — gérez votre risque*”
 
 # ─────────────────────────────────────────────
 
-last_signal = {“XAUUSD”: None, “US100.cash”: None}
+last_signal = {“XAUUSD”: None, "US100.cash": None}
 
 async def main():
 bot = Bot(token=TELEGRAM_TOKEN)
