@@ -16,10 +16,10 @@ TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 SCAN_INTERVAL = 300
 
 # Sessions de trading (UTC)
-SESSION_LONDON_START  = 6
+SESSION_LONDON_START  = 8
 SESSION_LONDON_END    = 17
 SESSION_NY_START      = 13
-SESSION_NY_END        = 19
+SESSION_NY_END        = 22
 
 XAUUSD_CONFIG = {
     "symbol"    : "XAU/USD",
@@ -131,9 +131,9 @@ def analyze_xauusd():
     bull_imp, bear_imp = double_impulse(df)
     adx_ok = adx_now > cfg["adx_min"]
     if ema_f > ema_s and plus_now > minus_now and adx_ok and bull_imp:
-        return ("BUY",  price, round(price + cfg["tp_pts"], 2), round(price - cfg["sl_pts"], 2), round(adx_now, 1), "ADX")
+        return ("BUY",  price, round(price + cfg["tp_pts"], 2), round(price - cfg["sl_pts"], 2), round(adx_now, 1), "ADX", ema_f, ema_s)
     if ema_f < ema_s and minus_now > plus_now and adx_ok and bear_imp:
-        return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(adx_now, 1), "ADX")
+        return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(adx_now, 1), "ADX", ema_f, ema_s)
     return None
 
 def analyze_us100():
@@ -150,9 +150,9 @@ def analyze_us100():
     rsi_now  = float(df["rsi"].iloc[-1])
     rsi_prev = float(df["rsi"].iloc[-2])
     if ema_f > ema_s and rsi_prev < cfg["rsi_os"] and rsi_now > cfg["rsi_os"]:
-        return ("BUY",  price, round(price + cfg["tp_pts"], 2), round(price - cfg["sl_pts"], 2), round(rsi_now, 1), "RSI")
+        return ("BUY",  price, round(price + cfg["tp_pts"], 2), round(price - cfg["sl_pts"], 2), round(rsi_now, 1), "RSI", ema_f, ema_s)
     if ema_f < ema_s and rsi_prev > cfg["rsi_ob"] and rsi_now < cfg["rsi_ob"]:
-        return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(rsi_now, 1), "RSI")
+        return ("SELL", price, round(price - cfg["tp_pts"], 2), round(price + cfg["sl_pts"], 2), round(rsi_now, 1), "RSI", ema_f, ema_s)
     return None
 
 def format_message(label, direction, price, tp, sl, ind_val, ind_name):
@@ -187,10 +187,10 @@ async def main():
 
             xau = analyze_xauusd()
             if xau:
-                direction, price, tp, sl, ind, ind_name = xau
+                direction, price, tp, sl, ind, ind_name, ema_f, ema_s = xau
                 key = direction + "_" + str(round(price, 0))
                 if last_signal["XAUUSD"] != key:
-                    msg = format_message("XAUUSD", direction, price, tp, sl, ind, ind_name)
+                    msg = format_message("XAUUSD", direction, price, tp, sl, ind, ind_name, ema_f, ema_s)
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                     last_signal["XAUUSD"] = key
                     log.info("Signal XAUUSD: " + direction + " @ " + str(price))
@@ -201,10 +201,10 @@ async def main():
 
             us = analyze_us100()
             if us:
-                direction, price, tp, sl, ind, ind_name = us
+                direction, price, tp, sl, ind, ind_name, ema_f, ema_s = us
                 key = direction + "_" + str(round(price, 0))
                 if last_signal["US100"] != key:
-                    msg = format_message("US100", direction, price, tp, sl, ind, ind_name)
+                    msg = format_message("US100", direction, price, tp, sl, ind, ind_name, ema_f, ema_s)
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                     last_signal["US100"] = key
                     log.info("Signal US100: " + direction + " @ " + str(price))
