@@ -190,7 +190,7 @@ async def main():
                 direction, price, tp, sl, ind, ind_name, ema_f, ema_s = xau
                 key = direction + "_" + str(round(price, 0))
                 if last_signal["XAUUSD"] != key:
-                    msg = format_message("XAUUSD", direction, price, tp, sl, ind, ind_name, ema_f, ema_s)
+                    msg = format_message("XAUUSD", direction, price, tp, sl, ind, ind_name)
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                     last_signal["XAUUSD"] = key
                     log.info("Signal XAUUSD: " + direction + " @ " + str(price))
@@ -204,7 +204,7 @@ async def main():
                 direction, price, tp, sl, ind, ind_name, ema_f, ema_s = us
                 key = direction + "_" + str(round(price, 0))
                 if last_signal["US100"] != key:
-                    msg = format_message("US100", direction, price, tp, sl, ind, ind_name, ema_f, ema_s)
+                    msg = format_message("US100", direction, price, tp, sl, ind, ind_name)
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                     last_signal["US100"] = key
                     log.info("Signal US100: " + direction + " @ " + str(price))
