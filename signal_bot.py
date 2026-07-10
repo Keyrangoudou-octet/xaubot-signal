@@ -20,13 +20,6 @@ XAUUSD_CONFIG = {
     "atr_period": 14, "atr_sl_mult": 1.5,
     "swing_window": 5, "swing_lookback": 100,
 }
-US100_CONFIG = {
-    "symbol": "NDX", "label": "US100",
-    "ema_fast": 20, "ema_slow": 50,
-    "rsi_period": 14, "rsi_ob": 65, "rsi_os": 35,
-    "atr_period": 14, "atr_sl_mult": 1.5,
-    "swing_window": 5, "swing_lookback": 100,
-}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -55,10 +48,6 @@ def get_candles(symbol, interval="5min", outputsize=120):
 
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series, period=14):
-    d = series.diff()
-    return 100 - (100 / (1 + d.clip(lower=0).rolling(period).mean() / (-d.clip(upper=0)).rolling(period).mean()))
-
 def adx(df, period=14):
     hi, lo, cl = df["high"], df["low"], df["close"]
     plus_dm = hi.diff().clip(lower=0); minus_dm = (-lo.diff()).clip(lower=0)
@@ -75,8 +64,6 @@ def double_impulse(df):
     bull = (df["close"].iloc[-2]>df["open"].iloc[-2]) and (df["close"].iloc[-3]>df["open"].iloc[-3])
     bear = (df["close"].iloc[-2]<df["open"].iloc[-2]) and (df["close"].iloc[-3]<df["open"].iloc[-3])
     return bull, bear
-
-# ── FIBONACCI ──────────────────────────────────────────
 
 def find_swing_high(df, window=5, lookback=100):
     r = df.tail(lookback).reset_index(drop=True)
@@ -102,7 +89,6 @@ def fibonacci_levels(sh, sl):
     return {"38.2": round(sh-0.382*d,2), "50.0": round(sh-0.500*d,2), "61.8": round(sh-0.618*d,2)}
 
 def nearest_fibo(price, fib):
-    """Retourne le niveau Fibo le plus proche — informatif, pas de filtre."""
     if fib is None: return "—"
     best, dist = None, float("inf")
     for k in ["38.2", "50.0", "61.8"]:
@@ -110,15 +96,11 @@ def nearest_fibo(price, fib):
         if d < dist: dist, best = d, k
     return best
 
-# ── FILTRE H1 ──────────────────────────────────────────
-
 def get_htf_trend(symbol):
     df = get_candles(symbol, interval="1h", outputsize=60)
     if df is None or len(df) < 55: return None
     df["ef"] = ema(df["close"], 15); df["es"] = ema(df["close"], 50)
     return "BULL" if float(df["ef"].iloc[-1]) > float(df["es"].iloc[-1]) else "BEAR"
-
-# ── XAUUSD ─────────────────────────────────────────────
 
 def analyze_xauusd():
     cfg = XAUUSD_CONFIG
@@ -144,32 +126,6 @@ def analyze_xauusd():
         return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib_lvl)
     return None
 
-# ── US100 ──────────────────────────────────────────────
-
-def analyze_us100():
-    cfg = US100_CONFIG
-    htf = get_htf_trend(cfg["symbol"])
-    if not htf: return None
-    df = get_candles(cfg["symbol"])
-    if df is None or len(df) < 60: return None
-    df["ef"] = ema(df["close"], cfg["ema_fast"]); df["es"] = ema(df["close"], cfg["ema_slow"])
-    df["rsi_v"] = rsi(df["close"], cfg["rsi_period"]); df["atr_v"] = atr(df, cfg["atr_period"])
-    price   = round(float(df["close"].iloc[-1]), 2)
-    ef, es  = float(df["ef"].iloc[-1]), float(df["es"].iloc[-1])
-    rsi_now = float(df["rsi_v"].iloc[-1]); rsi_prev = float(df["rsi_v"].iloc[-2])
-    atr_v   = float(df["atr_v"].iloc[-1])
-    sh = find_swing_high(df, cfg["swing_window"], cfg["swing_lookback"])
-    sl_s = find_swing_low(df, cfg["swing_window"], cfg["swing_lookback"])
-    fib_lvl = nearest_fibo(price, fibonacci_levels(sh, sl_s))
-    sd = round(atr_v * cfg["atr_sl_mult"], 2)
-    if ef>es and rsi_prev<cfg["rsi_os"] and rsi_now>cfg["rsi_os"] and htf=="BULL":
-        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(rsi_now,1), htf, fib_lvl)
-    if ef<es and rsi_prev>cfg["rsi_ob"] and rsi_now<cfg["rsi_ob"] and htf=="BEAR":
-        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(rsi_now,1), htf, fib_lvl)
-    return None
-
-# ── FORMAT MESSAGE ─────────────────────────────────────
-
 def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib_level):
     now  = datetime.utcnow().strftime("%H:%M UTC")
     arrow = "🟢" if direction == "BUY" else "🔴"
@@ -192,15 +148,13 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib_lev
     msg += "⚠️ Signal indicatif - vérifiez sur MT5"
     return msg
 
-# ── MAIN ───────────────────────────────────────────────
-
-last_signal = {"XAUUSD": None, "US100": None}
+last_signal = {"XAUUSD": None}
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
         text="🤖 XauBot Signal v3 démarré\nFiltre H1 ✅ | Fibonacci informatif (swing points) ✅")
-    log.info("Bot démarré v3")
+    log.info("Bot démarré v3 - XAUUSD uniquement")
     while True:
         try:
             if not is_market_open():
@@ -214,16 +168,6 @@ async def main():
                     last_signal["XAUUSD"] = key
                     log.info("XAUUSD "+d+" @ "+str(p)+" | Fibo "+str(fl)+"% | "+htf)
             else: last_signal["XAUUSD"] = None
-            await asyncio.sleep(5)
-            us = analyze_us100()
-            if us:
-                d,p,sl,tp1,tp2,tp3,v,htf,fl = us
-                key = d+"_"+str(round(p,0))
-                if last_signal["US100"] != key:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_message("US100",d,p,sl,tp1,tp2,tp3,v,htf,fl))
-                    last_signal["US100"] = key
-                    log.info("US100 "+d+" @ "+str(p)+" | Fibo "+str(fl)+"% | "+htf)
-            else: last_signal["US100"] = None
         except Exception as e:
             log.error("Erreur: "+str(e))
         await asyncio.sleep(SCAN_INTERVAL)
