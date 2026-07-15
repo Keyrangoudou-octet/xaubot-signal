@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v3 : filtre H1 + ATR + 3 TP + Fibonacci informatif (swing points)
+# v5 : niveaux Fibo exacts dans le signal Telegram + détection BREAKOUT live
 
 import asyncio, logging, os, requests, pandas as pd
 from datetime import datetime, timezone
@@ -65,6 +65,14 @@ def double_impulse(df):
     bear = (df["close"].iloc[-2]<df["open"].iloc[-2]) and (df["close"].iloc[-3]<df["open"].iloc[-3])
     return bull, bear
 
+def live_breakout(df, atr_v):
+    c = float(df["close"].iloc[-1])
+    o = float(df["open"].iloc[-1])
+    body = abs(c - o)
+    bull = (c > o) and (body > atr_v * 2.0)
+    bear = (c < o) and (body > atr_v * 2.0)
+    return bull, bear
+
 def find_swing_high(df, window=5, lookback=100):
     r = df.tail(lookback).reset_index(drop=True)
     for i in range(len(r)-window-1, window-1, -1):
@@ -86,15 +94,11 @@ def find_swing_low(df, window=5, lookback=100):
 def fibonacci_levels(sh, sl):
     d = sh - sl
     if d == 0: return None
-    return {"38.2": round(sh-0.382*d,2), "50.0": round(sh-0.500*d,2), "61.8": round(sh-0.618*d,2)}
-
-def nearest_fibo(price, fib):
-    if fib is None: return "—"
-    best, dist = None, float("inf")
-    for k in ["38.2", "50.0", "61.8"]:
-        d = abs(price - fib[k])
-        if d < dist: dist, best = d, k
-    return best
+    return {
+        "38.2": round(sh - 0.382*d, 2),
+        "50.0": round(sh - 0.500*d, 2),
+        "61.8": round(sh - 0.618*d, 2)
+    }
 
 def get_htf_trend(symbol):
     df = get_candles(symbol, interval="1h", outputsize=60)
@@ -118,21 +122,35 @@ def analyze_xauusd():
     bull_i, bear_i = double_impulse(df)
     sh = find_swing_high(df, cfg["swing_window"], cfg["swing_lookback"])
     sl_s = find_swing_low(df, cfg["swing_window"], cfg["swing_lookback"])
-    fib_lvl = nearest_fibo(price, fibonacci_levels(sh, sl_s))
+    fib = fibonacci_levels(sh, sl_s)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
+
+    bull_live, bear_live = live_breakout(df, atr_v)
+    if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live and htf=="BULL":
+        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, "BREAKOUT")
+    if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live and htf=="BEAR":
+        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, "BREAKOUT")
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
-        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib_lvl)
+        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, "SIGNAL")
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
-        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib_lvl)
+        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, "SIGNAL")
     return None
 
-def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib_level):
-    now  = datetime.utcnow().strftime("%H:%M UTC")
+def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, signal_type="SIGNAL"):
+    now   = datetime.utcnow().strftime("%H:%M UTC")
     arrow = "🟢" if direction == "BUY" else "🔴"
     icon  = "✅" if (direction=="BUY" and htf=="BULL") or (direction=="SELL" and htf=="BEAR") else "⚠️"
-    sl_d  = round(abs(price-sl), 2)
-    msg  = arrow + " " + direction + " SIGNAL - " + label + "\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n"
+    sl_d  = round(abs(price - sl), 2)
+
+    if signal_type == "BREAKOUT":
+        msg  = "⚡ BREAKOUT " + direction + " - " + label + "\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+        msg += "🔥 Rupture en cours — prépare le retracement\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+    else:
+        msg  = arrow + " " + direction + " SIGNAL - " + label + "\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+
     msg += "🕐 Heure  : " + now + "\n"
     msg += "📍 Entry  : " + str(price) + "\n"
     msg += "🛑 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
@@ -143,9 +161,16 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib_lev
     msg += "━━━━━━━━━━━━━━━━━━\n"
     msg += "📊 ADX    : " + str(val) + "\n"
     msg += "📈 H1     : " + htf + " " + icon + "\n"
-    msg += "📐 Fibo   : " + str(fib_level) + "%\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
-    msg += "⚠️ Signal indicatif - vérifiez sur MT5"
+    if fib:
+        msg += "📐 Fibo 38.2% : " + str(fib["38.2"]) + "\n"
+        msg += "📐 Fibo 50.0% : " + str(fib["50.0"]) + "\n"
+        msg += "📐 Fibo 61.8% : " + str(fib["61.8"]) + "\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+    if signal_type == "BREAKOUT":
+        msg += "⚠️ Bougie non clôturée — attends le retracement Fibo"
+    else:
+        msg += "⚠️ Signal indicatif — vérifiez sur MT5"
     return msg
 
 last_signal = {"XAUUSD": None}
@@ -153,21 +178,23 @@ last_signal = {"XAUUSD": None}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="🤖 XauBot Signal v3 démarré\nFiltre H1 ✅ | Fibonacci informatif (swing points) ✅")
-    log.info("Bot démarré v3 - XAUUSD uniquement")
+        text="🤖 XauBot Signal v5 démarré\nFiltre H1 ✅ | Fibo niveaux exacts ✅ | Breakout live ✅")
+    log.info("Bot démarré v5 - XAUUSD | Fibo niveaux + Breakout live")
     while True:
         try:
             if not is_market_open():
                 log.info("Marché fermé"); await asyncio.sleep(SCAN_INTERVAL); continue
             xau = analyze_xauusd()
             if xau:
-                d,p,sl,tp1,tp2,tp3,v,htf,fl = xau
-                key = d+"_"+str(round(p,0))
+                d,p,sl,tp1,tp2,tp3,v,htf,fib,st = xau
+                key = d+"_"+str(round(p,0))+"_"+st
                 if last_signal["XAUUSD"] != key:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fl))
+                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                        text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,st))
                     last_signal["XAUUSD"] = key
-                    log.info("XAUUSD "+d+" @ "+str(p)+" | Fibo "+str(fl)+"% | "+htf)
-            else: last_signal["XAUUSD"] = None
+                    log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf)
+            else:
+                last_signal["XAUUSD"] = None
         except Exception as e:
             log.error("Erreur: "+str(e))
         await asyncio.sleep(SCAN_INTERVAL)
