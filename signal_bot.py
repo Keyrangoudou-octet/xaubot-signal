@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v9 : + détection patterns bougies (pin bar, doji, engulfing, marubozu)
+# v10 : Signal classique = Fibo % (v3 format) | BREAKOUT = 3 niveaux prix | patterns | BREAKOUT sans H1
 
 import asyncio, logging, os, requests, pandas as pd
 from datetime import datetime, timezone
@@ -69,28 +69,24 @@ def live_breakout(df, atr_v):
     c = float(df["close"].iloc[-1])
     o = float(df["open"].iloc[-1])
     body = abs(c - o)
-    bull = (c > o) and (body > atr_v * 2.0)
-    bear = (c < o) and (body > atr_v * 2.0)
-    return bull, bear
+    return (c > o) and (body > atr_v * 2.0), (c < o) and (body > atr_v * 2.0)
 
 def detect_pattern(df):
-    o  = float(df["open"].iloc[-2]);  h  = float(df["high"].iloc[-2])
-    l  = float(df["low"].iloc[-2]);   c  = float(df["close"].iloc[-2])
+    o  = float(df["open"].iloc[-2]);  h = float(df["high"].iloc[-2])
+    l  = float(df["low"].iloc[-2]);   c = float(df["close"].iloc[-2])
     o2 = float(df["open"].iloc[-3]);  c2 = float(df["close"].iloc[-3])
     total = h - l
     if total == 0: return None
-    body       = abs(c - o)
+    body = abs(c - o)
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
-    body_pct   = body / total
-    upper_pct  = upper_wick / total
-    lower_pct  = lower_wick / total
-    if body_pct < 0.1:                              return "Doji ➖"
-    if body_pct > 0.85:                             return "Marubozu " + ("🟢" if c > o else "🔴")
-    if lower_pct > 0.6 and body_pct < 0.3:         return "Pin Bar 🔼"
-    if upper_pct > 0.6 and body_pct < 0.3:         return "Pin Bar 🔽"
-    if c > o and c2 < o2 and c > o2 and o < c2:    return "Engulfing 🔼"
-    if c < o and c2 > o2 and c < o2 and o > c2:    return "Engulfing 🔽"
+    bp = body / total; up = upper_wick / total; lp = lower_wick / total
+    if bp < 0.1:                                 return "Doji"
+    if bp > 0.85:                                return "Marubozu " + ("Bull" if c > o else "Bear")
+    if lp > 0.6 and bp < 0.3:                   return "Pin Bar Bull"
+    if up > 0.6 and bp < 0.3:                   return "Pin Bar Bear"
+    if c > o and c2 < o2 and c > o2 and o < c2: return "Engulfing Bull"
+    if c < o and c2 > o2 and c < o2 and o > c2: return "Engulfing Bear"
     return None
 
 def fibo_range(df, lookback=50):
@@ -100,11 +96,15 @@ def fibo_range(df, lookback=50):
 def fibonacci_levels(sh, sl):
     d = sh - sl
     if d == 0: return None
-    return {
-        "38.2": round(sh - 0.382*d, 2),
-        "50.0": round(sh - 0.500*d, 2),
-        "61.8": round(sh - 0.618*d, 2)
-    }
+    return {"38.2": round(sh-0.382*d,2), "50.0": round(sh-0.500*d,2), "61.8": round(sh-0.618*d,2)}
+
+def nearest_fibo(price, fib):
+    if fib is None: return "---"
+    best, dist = None, float("inf")
+    for k in ["38.2", "50.0", "61.8"]:
+        d = abs(price - fib[k])
+        if d < dist: dist, best = d, k
+    return best
 
 def get_htf_trend(symbol):
     df = get_candles(symbol, interval="1h", outputsize=60)
@@ -126,72 +126,66 @@ def analyze_xauusd():
     adx_v  = float(adx_s.iloc[-1]); pdi_v = float(pdi.iloc[-1]); mdi_v = float(mdi.iloc[-1])
     atr_v  = float(df["atr_v"].iloc[-1])
     bull_i, bear_i = double_impulse(df)
+    bull_live, bear_live = live_breakout(df, atr_v)
     sh, sl_s = fibo_range(df, cfg["fibo_lookback"])
     fib = fibonacci_levels(sh, sl_s)
+    fib_lvl = nearest_fibo(price, fib)
     pattern = detect_pattern(df)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
 
-    bull_live, bear_live = live_breakout(df, atr_v)
+    # PRIORITE 1 : BREAKOUT live (bougie > 2xATR) - sans filtre H1
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
-        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, "BREAKOUT", pattern)
+        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
-        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, "BREAKOUT", pattern)
+        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
 
+    # PRIORITE 2 : signal classique (double impulsion) - avec filtre H1
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
-        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, "SIGNAL", pattern)
+        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
-        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, "SIGNAL", pattern)
+        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern)
     return None
 
-def nearest_fibo(price, fib):
-    if fib is None: return "—"
-    best, dist = None, float("inf")
-    for k in ["38.2", "50.0", "61.8"]:
-        d = abs(price - fib[k])
-        if d < dist: dist, best = d, k
-    return best
-
-def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, signal_type="SIGNAL", pattern=None):
+def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fib_lvl, signal_type="SIGNAL", pattern=None):
     now   = datetime.utcnow().strftime("%H:%M UTC")
-    arrow = "🟢" if direction == "BUY" else "🔴"
+    arrow = "\U0001f7e2" if direction == "BUY" else "\U0001f534"
     icon  = "✅" if (direction=="BUY" and htf=="BULL") or (direction=="SELL" and htf=="BEAR") else "⚠️"
     sl_d  = round(abs(price - sl), 2)
 
     if signal_type == "BREAKOUT":
         msg  = "⚡ BREAKOUT " + direction + " - " + label + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "🔥 Rupture en cours — prépare le retracement\n"
+        msg += "\U0001f525 Rupture en cours — preparer le retracement\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
     else:
         msg  = arrow + " " + direction + " SIGNAL - " + label + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
 
-    msg += "🕐 Heure  : " + now + "\n"
-    msg += "📍 Entry  : " + str(price) + "\n"
-    msg += "🛑 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
+    msg += "\U0001f550 Heure  : " + now + "\n"
+    msg += "\U0001f4cd Entry  : " + str(price) + "\n"
+    msg += "\U0001f6d1 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
-    msg += "🎯 TP1    : " + str(tp1) + "  (RR 1:1)\n"
-    msg += "🎯 TP2    : " + str(tp2) + "  (RR 1:2)\n"
-    msg += "🎯 TP3    : " + str(tp3) + "  (RR 1:3)\n"
+    msg += "\U0001f3af TP1    : " + str(tp1) + "  (RR 1:1)\n"
+    msg += "\U0001f3af TP2    : " + str(tp2) + "  (RR 1:2)\n"
+    msg += "\U0001f3af TP3    : " + str(tp3) + "  (RR 1:3)\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
-    msg += "📊 ADX    : " + str(val) + "\n"
-    msg += "📈 H1     : " + htf + " " + icon + "\n"
+    msg += "\U0001f4ca ADX    : " + str(val) + "\n"
+    msg += "\U0001f4c8 H1     : " + htf + " " + icon + "\n"
     if pattern:
-        msg += "🕯️ Pattern : " + pattern + "\n"
+        msg += "\U0001f56f Pattern : " + pattern + "\n"
 
     if signal_type == "BREAKOUT":
         msg += "━━━━━━━━━━━━━━━━━━\n"
         if fib:
-            msg += "📐 Fibo 38.2% : " + str(fib["38.2"]) + "\n"
-            msg += "📐 Fibo 50.0% : " + str(fib["50.0"]) + "\n"
-            msg += "📐 Fibo 61.8% : " + str(fib["61.8"]) + "\n"
+            msg += "\U0001f4d0 Fibo 38.2% : " + str(fib["38.2"]) + "\n"
+            msg += "\U0001f4d0 Fibo 50.0% : " + str(fib["50.0"]) + "\n"
+            msg += "\U0001f4d0 Fibo 61.8% : " + str(fib["61.8"]) + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "⚠️ Bougie non clôturée - attends le retracement Fibo"
+        msg += "⚠️ Bougie non cloturee - attends le retracement Fibo"
     else:
-        fib_lvl = nearest_fibo(price, fib)
-        msg += "📐 Fibo   : " + str(fib_lvl) + "%\n"
+        msg += "\U0001f4d0 Fibo   : " + str(fib_lvl) + "%\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "⚠️ Signal indicatif - vérifiez sur MT5"
+        msg += "⚠️ Signal indicatif - verifiez sur MT5"
     return msg
 
 last_signal = {"XAUUSD": None}
@@ -199,21 +193,21 @@ last_signal = {"XAUUSD": None}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="🤖 XauBot Signal v9 démarré\nPatterns bougies ✅ | Fibo absolu 50 bougies ✅ | BREAKOUT sans H1 ✅")
-    log.info("Bot démarré v9 - XAUUSD | Patterns + Fibo absolu + BREAKOUT sans H1")
+        text="XauBot Signal v10 demarre\nPatterns OK | Fibo signal / niveaux BREAKOUT OK | BREAKOUT sans H1 OK")
+    log.info("Bot demarre v10")
     while True:
         try:
             if not is_market_open():
-                log.info("Marché fermé"); await asyncio.sleep(SCAN_INTERVAL); continue
+                log.info("Marche ferme"); await asyncio.sleep(SCAN_INTERVAL); continue
             xau = analyze_xauusd()
             if xau:
-                d,p,sl,tp1,tp2,tp3,v,htf,fib,st,pat = xau
+                d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat = xau
                 key = d+"_"+str(round(p,0))+"_"+st
                 if last_signal["XAUUSD"] != key:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                        text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,st,pat))
+                        text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat))
                     last_signal["XAUUSD"] = key
-                    log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | "+str(pat))
+                    log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | Fibo "+str(fl)+" | "+str(pat))
             else:
                 last_signal["XAUUSD"] = None
         except Exception as e:
