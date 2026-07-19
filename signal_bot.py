@@ -1,7 +1,8 @@
+
 # XauBot Signal Bot - Railway / Twelve Data
 # v10 : Signal classique = Fibo % (v3 format) | BREAKOUT = 3 niveaux prix | patterns | BREAKOUT sans H1
 
-import asyncio, logging, os, requests, pandas as pd
+import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
 from telegram import Bot
 
@@ -9,9 +10,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 300
-SESSION_LONDON_START, SESSION_LONDON_END = 8, 17
-SESSION_NY_START, SESSION_NY_END = 13, 22
+SCAN_INTERVAL = 120    # 2 min — optimise pour quota 800 calls/jour
+SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
 
 XAUUSD_CONFIG = {
     "symbol": "XAU/USD", "label": "XAUUSD",
@@ -26,9 +26,11 @@ log = logging.getLogger(__name__)
 
 def is_market_open():
     now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() >= 5: return False
-    h = now_utc.hour
-    return (SESSION_LONDON_START <= h < SESSION_LONDON_END) or (SESSION_NY_START <= h < SESSION_NY_END)
+    wd = now_utc.weekday()  # 0=Mon ... 6=Sun
+    h  = now_utc.hour
+    if wd == 5: return False                    # Samedi : fermé
+    if wd == 6: return False                    # Dimanche : fermé
+    return 13 <= h < 22                         # Lun-Ven : 13h-22h UTC (London/NY overlap + NY)
 
 def get_candles(symbol, interval="5min", outputsize=120):
     try:
@@ -66,10 +68,15 @@ def double_impulse(df):
     return bull, bear
 
 def live_breakout(df, atr_v):
-    c = float(df["close"].iloc[-1])
-    o = float(df["open"].iloc[-1])
-    body = abs(c - o)
-    return (c > o) and (body > atr_v * 2.0), (c < o) and (body > atr_v * 2.0)
+    # Vérifie la bougie en cours ET la dernière clôturée | seuil 1.5xATR pour détecter plus tôt
+    bull, bear = False, False
+    for idx in [-1, -2]:
+        c = float(df["close"].iloc[idx])
+        o = float(df["open"].iloc[idx])
+        body = abs(c - o)
+        if (c > o) and (body > atr_v * 1.5): bull = True
+        if (c < o) and (body > atr_v * 1.5): bear = True
+    return bull, bear
 
 def detect_pattern(df):
     o  = float(df["open"].iloc[-2]);  h = float(df["high"].iloc[-2])
@@ -81,10 +88,10 @@ def detect_pattern(df):
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
     bp = body / total; up = upper_wick / total; lp = lower_wick / total
-    if bp < 0.1:                                 return "Doji"
-    if bp > 0.85:                                return "Marubozu " + ("Bull" if c > o else "Bear")
-    if lp > 0.6 and bp < 0.3:                   return "Pin Bar Bull"
-    if up > 0.6 and bp < 0.3:                   return "Pin Bar Bear"
+    if bp < 0.1:                           return "Doji"
+    if bp > 0.85:                          return "Marubozu " + ("Bull" if c > o else "Bear")
+    if lp > 0.6 and bp < 0.3:             return "Pin Bar Bull"
+    if up > 0.6 and bp < 0.3:             return "Pin Bar Bear"
     if c > o and c2 < o2 and c > o2 and o < c2: return "Engulfing Bull"
     if c < o and c2 > o2 and c < o2 and o > c2: return "Engulfing Bear"
     return None
@@ -133,10 +140,10 @@ def analyze_xauusd():
     pattern = detect_pattern(df)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
 
-    # PRIORITE 1 : BREAKOUT live (bougie > 2xATR) - sans filtre H1
-    if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
+    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA - réagit plus vite)
+    if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
         return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
-    if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
+    if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
         return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
 
     # PRIORITE 2 : signal classique (double impulsion) - avec filtre H1
@@ -188,12 +195,12 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
         msg += "⚠️ Signal indicatif - verifiez sur MT5"
     return msg
 
-last_signal = {"XAUUSD": None}
+last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v10 demarre\nPatterns OK | Fibo signal / niveaux BREAKOUT OK | BREAKOUT sans H1 OK")
+        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | BREAKOUT 1.5xATR | Cooldown 15min | DI sans EMA")
     log.info("Bot demarre v10")
     while True:
         try:
@@ -202,14 +209,14 @@ async def main():
             xau = analyze_xauusd()
             if xau:
                 d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat = xau
-                key = d+"_"+str(round(p,0))+"_"+st
-                if last_signal["XAUUSD"] != key:
+                prev = last_signal["XAUUSD"]
+                elapsed = time.time() - prev["ts"]
+                same = (prev["direction"] == d and prev["type"] == st)
+                if not same or elapsed > SIGNAL_COOLDOWN:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                         text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat))
-                    last_signal["XAUUSD"] = key
+                    last_signal["XAUUSD"] = {"direction": d, "type": st, "ts": time.time()}
                     log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | Fibo "+str(fl)+" | "+str(pat))
-            else:
-                last_signal["XAUUSD"] = None
         except Exception as e:
             log.error("Erreur: "+str(e))
         await asyncio.sleep(SCAN_INTERVAL)
