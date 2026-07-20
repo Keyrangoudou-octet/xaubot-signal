@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v10 : Signal classique = Fibo % | BREAKOUT = 3 niveaux prix | patterns | confirmation bougie
+# v11 : BREAKOUT live vs confirme (BREAKOUT_CONF) | corps confirmation min 0.3xATR | M30 trend
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -9,8 +9,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 120    # 2 min
-SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
+SCAN_INTERVAL = 120
+SIGNAL_COOLDOWN = 900
 
 XAUUSD_CONFIG = {
     "symbol": "XAU/USD", "label": "XAUUSD",
@@ -29,7 +29,7 @@ def is_market_open():
     h  = now_utc.hour
     if wd == 5: return False
     if wd == 6: return False
-    return 13 <= h < 22  # Lun-Ven : 13h-22h UTC
+    return 13 <= h < 22
 
 def get_candles(symbol, interval="5min", outputsize=120):
     try:
@@ -70,13 +70,13 @@ def live_breakout(df, atr_v):
     c1 = float(df["close"].iloc[-1]); o1 = float(df["open"].iloc[-1])
     c2 = float(df["close"].iloc[-2]); o2 = float(df["open"].iloc[-2])
     body1 = abs(c1 - o1); body2 = abs(c2 - o2)
-    # Bougie live grosse -> signal immédiat
-    if (c1 > o1) and (body1 > atr_v * 2.0): return True, False
-    if (c1 < o1) and (body1 > atr_v * 2.0): return False, True
-    # Bougie clôturée grosse -> exige confirmation de la bougie suivante (même direction)
-    if (c2 > o2) and (body2 > atr_v * 2.0) and (c1 > o1): return True, False
-    if (c2 < o2) and (body2 > atr_v * 2.0) and (c1 < o1): return False, True
-    return False, False
+    # Bougie live grosse -> signal immédiat (confirmed=False)
+    if (c1 > o1) and (body1 > atr_v * 2.0): return True, False, False
+    if (c1 < o1) and (body1 > atr_v * 2.0): return False, True, False
+    # Bougie clôturée grosse -> confirmation avec corps minimum 0.3xATR (confirmed=True)
+    if (c2 > o2) and (body2 > atr_v * 2.0) and (c1 > o1) and (body1 > atr_v * 0.3): return True, False, True
+    if (c2 < o2) and (body2 > atr_v * 2.0) and (c1 < o1) and (body1 > atr_v * 0.3): return False, True, True
+    return False, False, False
 
 def detect_pattern(df):
     o  = float(df["open"].iloc[-2]);  h = float(df["high"].iloc[-2])
@@ -133,20 +133,22 @@ def analyze_xauusd():
     adx_v  = float(adx_s.iloc[-1]); pdi_v = float(pdi.iloc[-1]); mdi_v = float(mdi.iloc[-1])
     atr_v  = float(df["atr_v"].iloc[-1])
     bull_i, bear_i = double_impulse(df)
-    bull_live, bear_live = live_breakout(df, atr_v)
+    bull_live, bear_live, confirmed = live_breakout(df, atr_v)
     sh, sl_s = fibo_range(df, cfg["fibo_lookback"])
     fib = fibonacci_levels(sh, sl_s)
     fib_lvl = nearest_fibo(price, fib)
     pattern = detect_pattern(df)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
 
-    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA, confirmation bougie si déjà clôturée)
+    # PRIORITE 1 : BREAKOUT (bougie > 2xATR) - DI seul, sans EMA
     if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
-        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
+        st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
+        return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern)
     if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
-        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
+        st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
+        return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern)
 
-    # PRIORITE 2 : signal classique (double impulsion) - avec filtre M30
+    # PRIORITE 2 : signal classique (double impulsion) - filtre M30
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
         return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
@@ -159,7 +161,7 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
     icon  = "✅" if (direction=="BUY" and htf=="BULL") or (direction=="SELL" and htf=="BEAR") else "⚠️"
     sl_d  = round(abs(price - sl), 2)
 
-    if signal_type == "BREAKOUT":
+    if signal_type in ("BREAKOUT", "BREAKOUT_CONF"):
         msg  = "⚡ BREAKOUT " + direction + " - " + label + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
         msg += "\U0001f525 Rupture en cours — preparer le retracement\n"
@@ -181,14 +183,17 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
     if pattern:
         msg += "\U0001f56f Pattern : " + pattern + "\n"
 
-    if signal_type == "BREAKOUT":
+    if signal_type in ("BREAKOUT", "BREAKOUT_CONF"):
         msg += "━━━━━━━━━━━━━━━━━━\n"
         if fib:
             msg += "\U0001f4d0 Fibo 38.2% : " + str(fib["38.2"]) + "\n"
             msg += "\U0001f4d0 Fibo 50.0% : " + str(fib["50.0"]) + "\n"
             msg += "\U0001f4d0 Fibo 61.8% : " + str(fib["61.8"]) + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "⚠️ Bougie non cloturee - attends le retracement Fibo"
+        if signal_type == "BREAKOUT_CONF":
+            msg += "✅ Breakout confirme — attends le retracement Fibo"
+        else:
+            msg += "⚠️ Bougie en cours — attends la cloture et le retracement"
     else:
         msg += "\U0001f4d0 Fibo   : " + str(fib_lvl) + "%\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
@@ -200,8 +205,8 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | ADX 25 | BREAKOUT 2xATR + confirmation | M30 | Cooldown 15min")
-    log.info("Bot demarre v10")
+        text="XauBot Signal v11 demarre\nScan 2min | 13h-22h UTC | ADX 25 | BREAKOUT 2xATR + confirmation 0.3xATR | M30 | Cooldown 15min")
+    log.info("Bot demarre v11")
     while True:
         try:
             if not is_market_open():
