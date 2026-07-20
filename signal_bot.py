@@ -1,6 +1,5 @@
-
 # XauBot Signal Bot - Railway / Twelve Data
-# v10 : Signal classique = Fibo % (v3 format) | BREAKOUT = 3 niveaux prix | patterns | BREAKOUT sans H1
+# v10 : Signal classique = Fibo % (v3 format) | BREAKOUT = 3 niveaux prix | patterns | BREAKOUT sans filtre
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
 XAUUSD_CONFIG = {
     "symbol": "XAU/USD", "label": "XAUUSD",
     "ema_fast": 15, "ema_slow": 50,
-    "adx_period": 14, "adx_min": 20,
+    "adx_period": 14, "adx_min": 25,
     "atr_period": 14, "atr_sl_mult": 1.5,
     "fibo_lookback": 50,
 }
@@ -26,11 +25,11 @@ log = logging.getLogger(__name__)
 
 def is_market_open():
     now_utc = datetime.now(timezone.utc)
-    wd = now_utc.weekday()  # 0=Mon ... 6=Sun
+    wd = now_utc.weekday()
     h  = now_utc.hour
-    if wd == 5: return False                    # Samedi : fermé
-    if wd == 6: return False                    # Dimanche : fermé
-    return 13 <= h < 22                         # Lun-Ven : 13h-22h UTC (London/NY overlap + NY)
+    if wd == 5: return False
+    if wd == 6: return False
+    return 13 <= h < 22  # Lun-Ven : 13h-22h UTC
 
 def get_candles(symbol, interval="5min", outputsize=120):
     try:
@@ -68,14 +67,13 @@ def double_impulse(df):
     return bull, bear
 
 def live_breakout(df, atr_v):
-    # Vérifie la bougie en cours ET la dernière clôturée | seuil 1.5xATR pour détecter plus tôt
     bull, bear = False, False
     for idx in [-1, -2]:
         c = float(df["close"].iloc[idx])
         o = float(df["open"].iloc[idx])
         body = abs(c - o)
-        if (c > o) and (body > atr_v * 1.5): bull = True
-        if (c < o) and (body > atr_v * 1.5): bear = True
+        if (c > o) and (body > atr_v * 2.0): bull = True
+        if (c < o) and (body > atr_v * 2.0): bear = True
     return bull, bear
 
 def detect_pattern(df):
@@ -114,7 +112,7 @@ def nearest_fibo(price, fib):
     return best
 
 def get_htf_trend(symbol):
-    df = get_candles(symbol, interval="1h", outputsize=60)
+    df = get_candles(symbol, interval="30min", outputsize=60)
     if df is None or len(df) < 55: return None
     df["ef"] = ema(df["close"], 15); df["es"] = ema(df["close"], 50)
     return "BULL" if float(df["ef"].iloc[-1]) > float(df["es"].iloc[-1]) else "BEAR"
@@ -140,13 +138,13 @@ def analyze_xauusd():
     pattern = detect_pattern(df)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
 
-    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA - réagit plus vite)
+    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA, sans filtre M30)
     if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
         return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
     if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
         return ("SELL",price, round(price+sd,2), round(price-sd,2), round(price-sd*2,2), round(price-sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
 
-    # PRIORITE 2 : signal classique (double impulsion) - avec filtre H1
+    # PRIORITE 2 : signal classique (double impulsion) - avec filtre M30
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
         return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
@@ -177,7 +175,7 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
     msg += "\U0001f3af TP3    : " + str(tp3) + "  (RR 1:3)\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
     msg += "\U0001f4ca ADX    : " + str(val) + "\n"
-    msg += "\U0001f4c8 H1     : " + htf + " " + icon + "\n"
+    msg += "\U0001f4c8 M30    : " + htf + " " + icon + "\n"
     if pattern:
         msg += "\U0001f56f Pattern : " + pattern + "\n"
 
@@ -200,7 +198,7 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | BREAKOUT 1.5xATR | Cooldown 15min | DI sans EMA")
+        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | ADX 25 | BREAKOUT 2xATR | M30 filtre | Cooldown 15min")
     log.info("Bot demarre v10")
     while True:
         try:
