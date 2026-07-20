@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v10 : Signal classique = Fibo % (v3 format) | BREAKOUT = 3 niveaux prix | patterns | BREAKOUT sans filtre
+# v10 : Signal classique = Fibo % | BREAKOUT = 3 niveaux prix | patterns | confirmation bougie
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -9,7 +9,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 120    # 2 min — optimise pour quota 800 calls/jour
+SCAN_INTERVAL = 120    # 2 min
 SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
 
 XAUUSD_CONFIG = {
@@ -67,14 +67,16 @@ def double_impulse(df):
     return bull, bear
 
 def live_breakout(df, atr_v):
-    bull, bear = False, False
-    for idx in [-1, -2]:
-        c = float(df["close"].iloc[idx])
-        o = float(df["open"].iloc[idx])
-        body = abs(c - o)
-        if (c > o) and (body > atr_v * 2.0): bull = True
-        if (c < o) and (body > atr_v * 2.0): bear = True
-    return bull, bear
+    c1 = float(df["close"].iloc[-1]); o1 = float(df["open"].iloc[-1])
+    c2 = float(df["close"].iloc[-2]); o2 = float(df["open"].iloc[-2])
+    body1 = abs(c1 - o1); body2 = abs(c2 - o2)
+    # Bougie live grosse -> signal immédiat
+    if (c1 > o1) and (body1 > atr_v * 2.0): return True, False
+    if (c1 < o1) and (body1 > atr_v * 2.0): return False, True
+    # Bougie clôturée grosse -> exige confirmation de la bougie suivante (même direction)
+    if (c2 > o2) and (body2 > atr_v * 2.0) and (c1 > o1): return True, False
+    if (c2 < o2) and (body2 > atr_v * 2.0) and (c1 < o1): return False, True
+    return False, False
 
 def detect_pattern(df):
     o  = float(df["open"].iloc[-2]);  h = float(df["high"].iloc[-2])
@@ -138,7 +140,7 @@ def analyze_xauusd():
     pattern = detect_pattern(df)
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
 
-    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA, sans filtre M30)
+    # PRIORITE 1 : BREAKOUT (DI seul, sans EMA, confirmation bougie si déjà clôturée)
     if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
         return ("BUY", price, round(price-sd,2), round(price+sd,2), round(price+sd*2,2), round(price+sd*3,2), round(adx_v,1), htf, fib, fib_lvl, "BREAKOUT", pattern)
     if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
@@ -198,7 +200,7 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | ADX 25 | BREAKOUT 2xATR | M30 filtre | Cooldown 15min")
+        text="XauBot Signal v10 demarre\nScan 2min | 13h-22h UTC | ADX 25 | BREAKOUT 2xATR + confirmation | M30 | Cooldown 15min")
     log.info("Bot demarre v10")
     while True:
         try:
