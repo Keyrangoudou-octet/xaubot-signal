@@ -29,6 +29,7 @@ def is_market_open():
     h  = now_utc.hour
     if wd == 5: return False
     if wd == 6: return False
+    if wd == 4: return 8 <= h < 13   # Vendredi : 13h-16h UTC
     return 13 <= h < 22
 
 def get_candles(symbol, interval="5min", outputsize=120):
