@@ -214,9 +214,14 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
         else:
             msg += "⚠️ Bougie en cours — attends la cloture et le retracement"
     else:
-        msg += "\U0001f4d0 Fibo   : " + str(fib_lvl) + "%\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "⚠️ Signal indicatif - verifiez sur MT5"
+        if fib:
+            rec = recommend_fibo(rsi_v, val) if rsi_v is not None else "50.0"
+            for lvl in ["38.2", "50.0", "61.8"]:
+                star = " ⭐ RECOMMANDE" if lvl == rec else ""
+                msg += "\U0001f4d0 Fibo " + lvl + "% : " + str(fib[lvl]) + star + "\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+        msg += "📌 Placez votre limit order au Fibo ⭐"
     return msg
 
 last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
