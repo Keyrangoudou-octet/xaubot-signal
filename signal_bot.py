@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v14 : RSI ajouté | Recommandation Fibo automatique (RSI + ADX)
+# v16 : FVG 15M + Order Block 15M | Confluence FVG+OB
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -9,8 +9,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 120
-SIGNAL_COOLDOWN = 900
+SCAN_INTERVAL = 180    # 3 min — optimise pour quota 800 calls/jour (3 calls/scan : 30M + 5M + 15M FVG)
+SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
 
 XAUUSD_CONFIG = {
     "symbol": "XAU/USD", "label": "XAUUSD",
@@ -76,6 +76,41 @@ def recommend_fibo(rsi_v, adx_v):
         return "50.0"
     else:
         return "61.8"
+
+def detect_fvg(df, lookback=30):
+    price = float(df["close"].iloc[-1])
+    n = len(df)
+    end = n - 1
+    for i in range(end - 1, max(2, end - lookback), -1):
+        h0 = float(df["high"].iloc[i - 2])
+        l0 = float(df["low"].iloc[i - 2])
+        hi = float(df["high"].iloc[i])
+        li = float(df["low"].iloc[i])
+        if li > h0 and h0 <= price <= li:
+            return ("BULL", round(h0, 2), round(li, 2))
+        if hi < l0 and hi <= price <= l0:
+            return ("BEAR", round(hi, 2), round(l0, 2))
+    return None
+
+def detect_ob(df, lookback=30, atr_mult=1.5):
+    price = float(df["close"].iloc[-1])
+    n = len(df)
+    atr_v = float(atr(df).iloc[-1])
+    end = n - 1
+    for i in range(max(1, end - lookback), end - 3):
+        o  = float(df["open"].iloc[i])
+        c  = float(df["close"].iloc[i])
+        h  = float(df["high"].iloc[i])
+        l  = float(df["low"].iloc[i])
+        fu_h = max(float(df["high"].iloc[j]) for j in range(i+1, min(i+4, n)))
+        fu_l = min(float(df["low"].iloc[j])  for j in range(i+1, min(i+4, n)))
+        if c < o and (fu_h - h) > atr_mult * atr_v:
+            if l <= price <= h:
+                return ("BULL", round(l, 2), round(h, 2))
+        if c > o and (l - fu_l) > atr_mult * atr_v:
+            if l <= price <= h:
+                return ("BEAR", round(l, 2), round(h, 2))
+    return None
 
 def double_impulse(df):
     bull = (df["close"].iloc[-2]>df["open"].iloc[-2]) and (df["close"].iloc[-3]>df["open"].iloc[-3])
@@ -154,6 +189,9 @@ def analyze_xauusd():
     fib = fibonacci_levels(sh, sl_s)
     fib_lvl = nearest_fibo(price, fib)
     pattern = detect_pattern(df)
+    df15    = get_candles(cfg["symbol"], interval="15min", outputsize=60)
+    fvg     = detect_fvg(df15) if df15 is not None and len(df15) >= 10 else None
+    ob      = detect_ob(df15)  if df15 is not None and len(df15) >= 10 else None
     sd = round(atr_v * cfg["atr_sl_mult"], 2)
     tp1_d = round(atr_v * 0.8, 2)
     tp2_d = round(atr_v * 1.5, 2)
@@ -161,17 +199,17 @@ def analyze_xauusd():
 
     if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
         st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
-        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v)
+        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob)
     if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
         st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
-        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v)
+        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob)
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
-        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v)
+        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
-        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v)
+        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob)
     return None
 
-def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fib_lvl, signal_type="SIGNAL", pattern=None, rsi_v=None):
+def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fib_lvl, signal_type="SIGNAL", pattern=None, rsi_v=None, fvg=None, ob=None):
     now   = datetime.utcnow().strftime("%H:%M UTC")
     arrow = "\U0001f7e2" if direction == "BUY" else "\U0001f534"
     icon  = "✅" if (direction=="BUY" and htf=="BULL") or (direction=="SELL" and htf=="BEAR") else "⚠️"
@@ -197,6 +235,18 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
     msg += "\U0001f4ca ADX    : " + str(val) + "\n"
     if rsi_v is not None:
         msg += "\U0001f4c9 RSI    : " + str(rsi_v) + "\n"
+    if fvg:
+        fvg_icon = "✅" if (fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL") else "⚠️"
+        msg += "\U0001f4d0 FVG 15M : " + fvg[0] + " " + fvg_icon + " [" + str(fvg[1]) + "-" + str(fvg[2]) + "]\n"
+    else:
+        msg += "\U0001f4d0 FVG 15M : -\n"
+    if ob:
+        ob_icon = "✅" if (ob[0]=="BULL" and direction=="BUY") or (ob[0]=="BEAR" and direction=="SELL") else "⚠️"
+        msg += "\U0001f4e6 OB 15M  : " + ob[0] + " " + ob_icon + " [" + str(ob[1]) + "-" + str(ob[2]) + "]\n"
+    else:
+        msg += "\U0001f4e6 OB 15M  : -\n"
+    if fvg and ob and fvg[0] == ob[0] and ((fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL")):
+        msg += "\U0001f525 Confluence FVG+OB — zone tres forte !\n"
     msg += "\U0001f4c8 M30    : " + htf + " " + icon + "\n"
     if pattern:
         msg += "\U0001f56f Pattern : " + pattern + "\n"
@@ -229,23 +279,24 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v14 demarre\nScan 2min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo auto | M30 | Cooldown 15min")
-    log.info("Bot demarre v14")
+        text="XauBot Signal v16 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | Confluence | M30 | Cooldown 15min")
+    log.info("Bot demarre v16")
     while True:
         try:
             if not is_market_open():
                 log.info("Marche ferme"); await asyncio.sleep(SCAN_INTERVAL); continue
             xau = analyze_xauusd()
             if xau:
-                d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv = xau
+                d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob = xau
                 prev = last_signal["XAUUSD"]
                 elapsed = time.time() - prev["ts"]
                 same = (prev["direction"] == d and prev["type"] == st)
                 if not same or elapsed > SIGNAL_COOLDOWN:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                        text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv))
+                        text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob))
                     last_signal["XAUUSD"] = {"direction": d, "type": st, "ts": time.time()}
-                    log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | RSI "+str(rsiv)+" | Fibo "+str(fl)+" | "+str(pat))
+                    fvg_log = (fvg[0]+" ["+str(fvg[1])+"-"+str(fvg[2])+"]") if fvg else "no FVG"
+                    log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | RSI "+str(rsiv)+" | Fibo "+str(fl)+" | FVG "+fvg_log+" | "+str(pat))
         except Exception as e:
             log.error("Erreur: "+str(e))
         await asyncio.sleep(SCAN_INTERVAL)
