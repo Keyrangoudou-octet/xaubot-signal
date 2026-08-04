@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v16 : FVG 15M + Order Block 15M | Confluence FVG+OB
+# v17 : FVG 15M + Order Block 15M | Fix detection (sans condition prix strict)
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -9,8 +9,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 180    # 3 min — optimise pour quota 800 calls/jour (3 calls/scan : 30M + 5M + 15M FVG)
-SIGNAL_COOLDOWN = 900  # 15 min entre deux signaux meme direction
+SCAN_INTERVAL = 180
+SIGNAL_COOLDOWN = 900
 
 XAUUSD_CONFIG = {
     "symbol": "XAU/USD", "label": "XAUUSD",
@@ -78,7 +78,7 @@ def recommend_fibo(rsi_v, adx_v):
         return "61.8"
 
 def detect_fvg(df, lookback=30):
-    price = float(df["close"].iloc[-1])
+    """Detecte le FVG 15M le plus recent (sans condition de prix strict)."""
     n = len(df)
     end = n - 1
     for i in range(end - 1, max(2, end - lookback), -1):
@@ -86,18 +86,18 @@ def detect_fvg(df, lookback=30):
         l0 = float(df["low"].iloc[i - 2])
         hi = float(df["high"].iloc[i])
         li = float(df["low"].iloc[i])
-        if li > h0 and h0 <= price <= li:
+        if li > h0:   # Bullish FVG
             return ("BULL", round(h0, 2), round(li, 2))
-        if hi < l0 and hi <= price <= l0:
+        if hi < l0:   # Bearish FVG
             return ("BEAR", round(hi, 2), round(l0, 2))
     return None
 
 def detect_ob(df, lookback=30, atr_mult=1.5):
-    price = float(df["close"].iloc[-1])
+    """Detecte l'Order Block 15M le plus recent (sans condition de prix strict)."""
     n = len(df)
     atr_v = float(atr(df).iloc[-1])
     end = n - 1
-    for i in range(max(1, end - lookback), end - 3):
+    for i in range(end - 4, max(0, end - lookback), -1):
         o  = float(df["open"].iloc[i])
         c  = float(df["close"].iloc[i])
         h  = float(df["high"].iloc[i])
@@ -105,11 +105,9 @@ def detect_ob(df, lookback=30, atr_mult=1.5):
         fu_h = max(float(df["high"].iloc[j]) for j in range(i+1, min(i+4, n)))
         fu_l = min(float(df["low"].iloc[j])  for j in range(i+1, min(i+4, n)))
         if c < o and (fu_h - h) > atr_mult * atr_v:
-            if l <= price <= h:
-                return ("BULL", round(l, 2), round(h, 2))
+            return ("BULL", round(l, 2), round(h, 2))
         if c > o and (l - fu_l) > atr_mult * atr_v:
-            if l <= price <= h:
-                return ("BEAR", round(l, 2), round(h, 2))
+            return ("BEAR", round(l, 2), round(h, 2))
     return None
 
 def double_impulse(df):
@@ -237,12 +235,16 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
         msg += "\U0001f4c9 RSI    : " + str(rsi_v) + "\n"
     if fvg:
         fvg_icon = "✅" if (fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL") else "⚠️"
-        msg += "\U0001f4d0 FVG 15M : " + fvg[0] + " " + fvg_icon + " [" + str(fvg[1]) + "-" + str(fvg[2]) + "]\n"
+        zone_mid = (fvg[1] + fvg[2]) / 2
+        prox_fvg = " 📍PRIX DEDANS" if fvg[1] <= price <= fvg[2] else (" 🔜APPROCHE" if abs(price - zone_mid) < 20 else "")
+        msg += "\U0001f4d0 FVG 15M : " + fvg[0] + " " + fvg_icon + " [" + str(fvg[1]) + "-" + str(fvg[2]) + "]" + prox_fvg + "\n"
     else:
         msg += "\U0001f4d0 FVG 15M : -\n"
     if ob:
         ob_icon = "✅" if (ob[0]=="BULL" and direction=="BUY") or (ob[0]=="BEAR" and direction=="SELL") else "⚠️"
-        msg += "\U0001f4e6 OB 15M  : " + ob[0] + " " + ob_icon + " [" + str(ob[1]) + "-" + str(ob[2]) + "]\n"
+        ob_mid = (ob[1] + ob[2]) / 2
+        prox_ob = " 📍PRIX DEDANS" if ob[1] <= price <= ob[2] else (" 🔜APPROCHE" if abs(price - ob_mid) < 20 else "")
+        msg += "\U0001f4e6 OB 15M  : " + ob[0] + " " + ob_icon + " [" + str(ob[1]) + "-" + str(ob[2]) + "]" + prox_ob + "\n"
     else:
         msg += "\U0001f4e6 OB 15M  : -\n"
     if fvg and ob and fvg[0] == ob[0] and ((fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL")):
@@ -279,8 +281,8 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v16 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | Confluence | M30 | Cooldown 15min")
-    log.info("Bot demarre v16")
+        text="XauBot Signal v17 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | Confluence | M30 | Cooldown 15min")
+    log.info("Bot demarre v17")
     while True:
         try:
             if not is_market_open():
