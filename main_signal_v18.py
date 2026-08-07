@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v17 : FVG 15M + Order Block 15M | Fix detection (sans condition prix strict)
+# v18 : FVG 15M + Order Block 15M + CALCUL LIMIT AUTOMATIQUE (FVG/OB/Fibo confluence)
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -78,7 +78,6 @@ def recommend_fibo(rsi_v, adx_v):
         return "61.8"
 
 def detect_fvg(df, lookback=30):
-    """Detecte le FVG 15M le plus recent (sans condition de prix strict)."""
     n = len(df)
     end = n - 1
     for i in range(end - 1, max(2, end - lookback), -1):
@@ -86,14 +85,13 @@ def detect_fvg(df, lookback=30):
         l0 = float(df["low"].iloc[i - 2])
         hi = float(df["high"].iloc[i])
         li = float(df["low"].iloc[i])
-        if li > h0:   # Bullish FVG
+        if li > h0:
             return ("BULL", round(h0, 2), round(li, 2))
-        if hi < l0:   # Bearish FVG
+        if hi < l0:
             return ("BEAR", round(hi, 2), round(l0, 2))
     return None
 
 def detect_ob(df, lookback=30, atr_mult=1.5):
-    """Detecte l'Order Block 15M le plus recent (sans condition de prix strict)."""
     n = len(df)
     atr_v = float(atr(df).iloc[-1])
     end = n - 1
@@ -166,6 +164,107 @@ def get_htf_trend(symbol):
     df["ef"] = ema(df["close"], 15); df["es"] = ema(df["close"], 50)
     return "BULL" if float(df["ef"].iloc[-1]) > float(df["es"].iloc[-1]) else "BEAR"
 
+# ─────────────────────────────────────────────────────────────────
+# NOUVEAU v18 : Calcul automatique du niveau LIMIT optimal
+# ─────────────────────────────────────────────────────────────────
+
+def calc_limit_entry(direction, price, fib, fvg, ob, atr_v):
+    candidates = []
+    fib_scores = {"38.2": 10, "50.0": 15, "61.8": 25}
+    fib_list = [("38.2", fib["38.2"]), ("50.0", fib["50.0"]), ("61.8", fib["61.8"])] if fib else []
+
+    for lvl_name, lvl_price in fib_list:
+        if direction == "BUY" and lvl_price >= price: continue
+        if direction == "SELL" and lvl_price <= price: continue
+        score = fib_scores.get(lvl_name, 10)
+        has_fvg = False
+        has_ob  = False
+        zone_bottom = lvl_price - 3.0
+        if fvg and fvg[0] == ("BULL" if direction == "BUY" else "BEAR"):
+            fvg_low, fvg_high = fvg[1], fvg[2]
+            if fvg_low - 8 <= lvl_price <= fvg_high + 8:
+                score += 35; has_fvg = True
+                zone_bottom = min(zone_bottom, fvg_low - 2.0)
+        if ob and ob[0] == ("BULL" if direction == "BUY" else "BEAR"):
+            ob_low, ob_high = ob[1], ob[2]
+            if ob_low - 8 <= lvl_price <= ob_high + 8:
+                score += 40; has_ob = True
+                zone_bottom = min(zone_bottom, ob_low - 2.0)
+        sl = round(zone_bottom - atr_v * 0.3, 2) if direction == "BUY" else round(lvl_price + atr_v * 0.3 + 3.0, 2)
+        candidates.append({"fib": lvl_name, "limit": round(lvl_price, 2), "sl": sl,
+                            "score": score, "has_fvg": has_fvg, "has_ob": has_ob})
+
+    if not candidates:
+        if direction == "BUY":
+            if ob and ob[0] == "BULL":
+                s = 40 + (35 if fvg and fvg[0] == "BULL" else 0)
+                candidates.append({"fib": "OB", "limit": round(ob[2], 2),
+                                    "sl": round(ob[1] - 2.0, 2), "score": s,
+                                    "has_fvg": fvg is not None and fvg[0] == "BULL", "has_ob": True})
+            elif fvg and fvg[0] == "BULL":
+                candidates.append({"fib": "FVG", "limit": round(fvg[2], 2),
+                                    "sl": round(fvg[1] - 2.0, 2), "score": 35,
+                                    "has_fvg": True, "has_ob": False})
+        else:
+            if ob and ob[0] == "BEAR":
+                s = 40 + (35 if fvg and fvg[0] == "BEAR" else 0)
+                candidates.append({"fib": "OB", "limit": round(ob[1], 2),
+                                    "sl": round(ob[2] + 2.0, 2), "score": s,
+                                    "has_fvg": fvg is not None and fvg[0] == "BEAR", "has_ob": True})
+            elif fvg and fvg[0] == "BEAR":
+                candidates.append({"fib": "FVG", "limit": round(fvg[1], 2),
+                                    "sl": round(fvg[2] + 2.0, 2), "score": 35,
+                                    "has_fvg": True, "has_ob": False})
+
+    if not candidates:
+        return None
+
+    best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
+    best["confidence_label"] = "HIGH" if best["score"] >= 75 else ("MEDIUM" if best["score"] >= 55 else "LOW")
+    return best
+
+
+def format_limit_message(label, direction, price, limit_entry, atr_v):
+    if limit_entry is None:
+        return None
+    lp    = limit_entry["limit"]
+    sl    = limit_entry["sl"]
+    conf  = limit_entry["confidence_label"]
+    score = limit_entry["score"]   # ← clé correcte (bug corrigé)
+    fib   = limit_entry["fib"]
+
+    if direction == "BUY":
+        tp1 = round(lp + atr_v * 0.8, 2)
+        tp2 = round(lp + atr_v * 1.5, 2)
+        tp3 = round(lp + atr_v * 2.5, 2)
+    else:
+        tp1 = round(lp - atr_v * 0.8, 2)
+        tp2 = round(lp - atr_v * 1.5, 2)
+        tp3 = round(lp - atr_v * 2.5, 2)
+
+    conf_icon = "🟢" if conf == "HIGH" else ("🟡" if conf == "MEDIUM" else "🔴")
+    arrow     = "🟢" if direction == "BUY" else "🔴"
+    fib_label = ("Fibo " + str(fib) + "%") if fib not in ("OB", "FVG") else fib
+
+    msg  = "📌 ORDRE LIMIT CALCULE — " + label + "\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += arrow + " " + direction + " LIMIT @ " + str(lp) + "\n"
+    msg += "🛑 SL       : " + str(sl) + "\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "🎯 TP1      : " + str(tp1) + "\n"
+    msg += "🎯 TP2      : " + str(tp2) + "\n"
+    msg += "🎯 TP3      : " + str(tp3) + "\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "📐 Zone     : " + fib_label + "\n"
+    if limit_entry["has_fvg"]: msg += "✅ FVG alignée\n"
+    if limit_entry["has_ob"]:  msg += "✅ OB aligné\n"
+    msg += conf_icon + " Confiance : " + conf + " (" + str(score) + "/100)\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "⏳ Invalide si clôture sous SL ou en 20 bougies M15"
+    return msg
+
+# ─────────────────────────────────────────────────────────────────
+
 def analyze_xauusd():
     cfg = XAUUSD_CONFIG
     htf = get_htf_trend(cfg["symbol"])
@@ -197,61 +296,61 @@ def analyze_xauusd():
 
     if pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_live:
         st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
-        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob)
+        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob, atr_v)
     if mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_live:
         st = "BREAKOUT_CONF" if confirmed else "BREAKOUT"
-        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob)
+        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, st, pattern, rsi_v, fvg, ob, atr_v)
     if ef>es and pdi_v>mdi_v and adx_v>cfg["adx_min"] and bull_i and htf=="BULL":
-        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob)
+        return ("BUY", price, round(price-sd,2), round(price+tp1_d,2), round(price+tp2_d,2), round(price+tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob, atr_v)
     if ef<es and mdi_v>pdi_v and adx_v>cfg["adx_min"] and bear_i and htf=="BEAR":
-        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob)
+        return ("SELL",price, round(price+sd,2), round(price-tp1_d,2), round(price-tp2_d,2), round(price-tp3_d,2), round(adx_v,1), htf, fib, fib_lvl, "SIGNAL", pattern, rsi_v, fvg, ob, atr_v)
     return None
 
 def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fib_lvl, signal_type="SIGNAL", pattern=None, rsi_v=None, fvg=None, ob=None):
     now   = datetime.utcnow().strftime("%H:%M UTC")
-    arrow = "\U0001f7e2" if direction == "BUY" else "\U0001f534"
+    arrow = "🟢" if direction == "BUY" else "🔴"
     icon  = "✅" if (direction=="BUY" and htf=="BULL") or (direction=="SELL" and htf=="BEAR") else "⚠️"
     sl_d  = round(abs(price - sl), 2)
 
     if signal_type in ("BREAKOUT", "BREAKOUT_CONF"):
         msg  = "⚡ BREAKOUT " + direction + " - " + label + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
-        msg += "\U0001f525 Rupture en cours — preparer le retracement\n"
+        msg += "🔥 Rupture en cours — preparer le retracement\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
     else:
         msg  = arrow + " " + direction + " SIGNAL - " + label + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
 
-    msg += "\U0001f550 Heure  : " + now + "\n"
-    msg += "\U0001f4cd Entry  : " + str(price) + "\n"
-    msg += "\U0001f6d1 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
+    msg += "🕐 Heure  : " + now + "\n"
+    msg += "📍 Entry  : " + str(price) + "\n"
+    msg += "🛑 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
-    msg += "\U0001f3af TP1    : " + str(tp1) + "  (securiser 50%)\n"
-    msg += "\U0001f3af TP2    : " + str(tp2) + "  (RR 1:1)\n"
-    msg += "\U0001f3af TP3    : " + str(tp3) + "  (RR 1:1.7)\n"
+    msg += "🎯 TP1    : " + str(tp1) + "  (securiser 50%)\n"
+    msg += "🎯 TP2    : " + str(tp2) + "  (RR 1:1)\n"
+    msg += "🎯 TP3    : " + str(tp3) + "  (RR 1:1.7)\n"
     msg += "━━━━━━━━━━━━━━━━━━\n"
-    msg += "\U0001f4ca ADX    : " + str(val) + "\n"
+    msg += "📊 ADX    : " + str(val) + "\n"
     if rsi_v is not None:
-        msg += "\U0001f4c9 RSI    : " + str(rsi_v) + "\n"
+        msg += "📉 RSI    : " + str(rsi_v) + "\n"
     if fvg:
         fvg_icon = "✅" if (fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL") else "⚠️"
         zone_mid = (fvg[1] + fvg[2]) / 2
         prox_fvg = " 📍PRIX DEDANS" if fvg[1] <= price <= fvg[2] else (" 🔜APPROCHE" if abs(price - zone_mid) < 20 else "")
-        msg += "\U0001f4d0 FVG 15M : " + fvg[0] + " " + fvg_icon + " [" + str(fvg[1]) + "-" + str(fvg[2]) + "]" + prox_fvg + "\n"
+        msg += "📐 FVG 15M : " + fvg[0] + " " + fvg_icon + " [" + str(fvg[1]) + "-" + str(fvg[2]) + "]" + prox_fvg + "\n"
     else:
-        msg += "\U0001f4d0 FVG 15M : -\n"
+        msg += "📐 FVG 15M : -\n"
     if ob:
         ob_icon = "✅" if (ob[0]=="BULL" and direction=="BUY") or (ob[0]=="BEAR" and direction=="SELL") else "⚠️"
         ob_mid = (ob[1] + ob[2]) / 2
         prox_ob = " 📍PRIX DEDANS" if ob[1] <= price <= ob[2] else (" 🔜APPROCHE" if abs(price - ob_mid) < 20 else "")
-        msg += "\U0001f4e6 OB 15M  : " + ob[0] + " " + ob_icon + " [" + str(ob[1]) + "-" + str(ob[2]) + "]" + prox_ob + "\n"
+        msg += "📦 OB 15M  : " + ob[0] + " " + ob_icon + " [" + str(ob[1]) + "-" + str(ob[2]) + "]" + prox_ob + "\n"
     else:
-        msg += "\U0001f4e6 OB 15M  : -\n"
+        msg += "📦 OB 15M  : -\n"
     if fvg and ob and fvg[0] == ob[0] and ((fvg[0]=="BULL" and direction=="BUY") or (fvg[0]=="BEAR" and direction=="SELL")):
-        msg += "\U0001f525 Confluence FVG+OB — zone tres forte !\n"
-    msg += "\U0001f4c8 M30    : " + htf + " " + icon + "\n"
+        msg += "🔥 Confluence FVG+OB — zone tres forte !\n"
+    msg += "📈 M30    : " + htf + " " + icon + "\n"
     if pattern:
-        msg += "\U0001f56f Pattern : " + pattern + "\n"
+        msg += "🕯 Pattern : " + pattern + "\n"
 
     if signal_type in ("BREAKOUT", "BREAKOUT_CONF"):
         msg += "━━━━━━━━━━━━━━━━━━\n"
@@ -259,7 +358,7 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
             rec = recommend_fibo(rsi_v, val) if rsi_v is not None else "50.0"
             for lvl in ["38.2", "50.0", "61.8"]:
                 star = " ⭐ RECOMMANDE" if lvl == rec else ""
-                msg += "\U0001f4d0 Fibo " + lvl + "% : " + str(fib[lvl]) + star + "\n"
+                msg += "📐 Fibo " + lvl + "% : " + str(fib[lvl]) + star + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
         if signal_type == "BREAKOUT_CONF":
             msg += "✅ Breakout confirme — attends le retracement Fibo"
@@ -271,7 +370,7 @@ def format_message(label, direction, price, sl, tp1, tp2, tp3, val, htf, fib, fi
             rec = recommend_fibo(rsi_v, val) if rsi_v is not None else "50.0"
             for lvl in ["38.2", "50.0", "61.8"]:
                 star = " ⭐ RECOMMANDE" if lvl == rec else ""
-                msg += "\U0001f4d0 Fibo " + lvl + "% : " + str(fib[lvl]) + star + "\n"
+                msg += "📐 Fibo " + lvl + "% : " + str(fib[lvl]) + star + "\n"
         msg += "━━━━━━━━━━━━━━━━━━\n"
         msg += "📌 Placez votre limit order au Fibo ⭐"
     return msg
@@ -281,15 +380,15 @@ last_signal = {"XAUUSD": {"direction": None, "type": None, "ts": 0}}
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="XauBot Signal v17 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | Confluence | M30 | Cooldown 15min")
-    log.info("Bot demarre v17")
+        text="XauBot Signal v18 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | Confluence | M30 | Cooldown 15min | LIMIT AUTO")
+    log.info("Bot demarre v18")
     while True:
         try:
             if not is_market_open():
                 log.info("Marche ferme"); await asyncio.sleep(SCAN_INTERVAL); continue
             xau = analyze_xauusd()
             if xau:
-                d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob = xau
+                d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob,atr_v = xau
                 prev = last_signal["XAUUSD"]
                 elapsed = time.time() - prev["ts"]
                 same = (prev["direction"] == d and prev["type"] == st)
@@ -299,6 +398,14 @@ async def main():
                     last_signal["XAUUSD"] = {"direction": d, "type": st, "ts": time.time()}
                     fvg_log = (fvg[0]+" ["+str(fvg[1])+"-"+str(fvg[2])+"]") if fvg else "no FVG"
                     log.info("XAUUSD "+st+" "+d+" @ "+str(p)+" | "+htf+" | RSI "+str(rsiv)+" | Fibo "+str(fl)+" | FVG "+fvg_log+" | "+str(pat))
+
+                    await asyncio.sleep(2)
+                    limit_data = calc_limit_entry(d, p, fib, fvg, ob, atr_v)
+                    limit_msg  = format_limit_message("XAUUSD", d, p, limit_data, atr_v)
+                    if limit_msg:
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=limit_msg)
+                        log.info("Limit calcule: " + str(limit_data))
+
         except Exception as e:
             log.error("Erreur: "+str(e))
         await asyncio.sleep(SCAN_INTERVAL)
