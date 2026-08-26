@@ -1,5 +1,5 @@
 # XauBot Signal Bot - Railway / Twelve Data
-# v20 : FVG 15M + OB 15M + LIMIT AUTO + FUTURES OFFSET + M5 REFINEMENT
+# v21 : v20 + ENTRY_BUFFER (fix wick SL + BUY non déclenché)
 
 import asyncio, logging, os, time, requests, pandas as pd
 from datetime import datetime, timezone
@@ -15,8 +15,12 @@ SIGNAL_COOLDOWN = 1800  # 30 min anti-spam
 
 FUTURES_OFFSET = 0  # Mettre 0 si FTMO (spot XAU/USD)
 
+# Buffer $3 : BUY entrée légèrement plus haute (déclenche avant rebond)
+#             SELL SL légèrement plus large (absorbe les wicks)
+ENTRY_BUFFER = 3.0
+
 XAUUSD_CONFIG = {
-    "symbol": "XAU/USD", "label": "XAUUSD (MGC offset +{})".format(FUTURES_OFFSET),
+    "symbol": "XAU/USD", "label": "XAUUSD",
     "ema_fast": 15, "ema_slow": 50,
     "adx_period": 14, "adx_min": 25,
     "atr_period": 14, "atr_sl_mult": 1.5,
@@ -102,24 +106,29 @@ def refine_entry_m5(symbol, direction, limit_entry):
     df5 = get_candles(symbol, interval="5min", outputsize=60)
     if df5 is None or len(df5) < 10:
         limit_entry["refined"] = False; limit_entry["m5_source"] = None; return limit_entry
+
     fvg5 = detect_fvg(df5)
     if fvg5 and fvg5[0] == target_type:
         fvg_low, fvg_high = fvg5[1], fvg5[2]
         if fvg_low <= zone_high + 5 and fvg_high >= zone_low - 5:
-            entry = round(fvg_high if direction == "BUY" else fvg_low, 2)
-            new_sl = round(fvg_low - 2.0, 2) if direction == "BUY" else round(fvg_high + 2.0, 2)
+            entry = round(fvg_high + ENTRY_BUFFER if direction == "BUY" else fvg_low, 2)
+            new_sl = round(fvg_low - 2.0, 2) if direction == "BUY" else round(fvg_high + 2.0 + ENTRY_BUFFER, 2)
             limit_entry["limit"] = entry; limit_entry["sl"] = new_sl
             limit_entry["refined"] = True; limit_entry["m5_source"] = "FVG M5"
+            log.info("M5 refinement via FVG M5: " + str(entry))
             return limit_entry
+
     ob5 = detect_ob(df5)
     if ob5 and ob5[0] == target_type:
         ob_low, ob_high = ob5[1], ob5[2]
         if ob_low <= zone_high + 5 and ob_high >= zone_low - 5:
-            entry = round(ob_high if direction == "BUY" else ob_low, 2)
-            new_sl = round(ob_low - 2.0, 2) if direction == "BUY" else round(ob_high + 2.0, 2)
+            entry = round(ob_high + ENTRY_BUFFER if direction == "BUY" else ob_low, 2)
+            new_sl = round(ob_low - 2.0, 2) if direction == "BUY" else round(ob_high + 2.0 + ENTRY_BUFFER, 2)
             limit_entry["limit"] = entry; limit_entry["sl"] = new_sl
             limit_entry["refined"] = True; limit_entry["m5_source"] = "OB M5"
+            log.info("M5 refinement via OB M5: " + str(entry))
             return limit_entry
+
     limit_entry["refined"] = False; limit_entry["m5_source"] = None
     return limit_entry
 
@@ -194,7 +203,7 @@ def calc_limit_entry(direction, price, fib, fvg, ob, atr_v):
             ob_low,ob_high=ob[1],ob[2]
             if ob_low-8<=lvl_price<=ob_high+8:
                 score+=40; has_ob=True; zone_bottom=min(zone_bottom,ob_low-2.0)
-        sl=round(zone_bottom-atr_v*0.3,2) if direction=="BUY" else round(lvl_price+atr_v*0.3+3.0,2)
+        sl=round(zone_bottom-atr_v*0.3,2) if direction=="BUY" else round(lvl_price+atr_v*0.3+3.0+ENTRY_BUFFER,2)
         candidates.append({"fib":lvl_name,"limit":round(lvl_price,2),"sl":sl,"score":score,"has_fvg":has_fvg,"has_ob":has_ob})
     if not candidates:
         if direction=="BUY":
@@ -206,9 +215,9 @@ def calc_limit_entry(direction, price, fib, fvg, ob, atr_v):
         else:
             if ob and ob[0]=="BEAR":
                 s=40+(35 if fvg and fvg[0]=="BEAR" else 0)
-                candidates.append({"fib":"OB","limit":round(ob[1],2),"sl":round(ob[2]+2.0,2),"score":s,"has_fvg":fvg is not None and fvg[0]=="BEAR","has_ob":True})
+                candidates.append({"fib":"OB","limit":round(ob[1],2),"sl":round(ob[2]+2.0+ENTRY_BUFFER,2),"score":s,"has_fvg":fvg is not None and fvg[0]=="BEAR","has_ob":True})
             elif fvg and fvg[0]=="BEAR":
-                candidates.append({"fib":"FVG","limit":round(fvg[1],2),"sl":round(fvg[2]+2.0,2),"score":35,"has_fvg":True,"has_ob":False})
+                candidates.append({"fib":"FVG","limit":round(fvg[1],2),"sl":round(fvg[2]+2.0+ENTRY_BUFFER,2),"score":35,"has_fvg":True,"has_ob":False})
     if not candidates: return None
     best=sorted(candidates,key=lambda x:x["score"],reverse=True)[0]
     best["confidence_label"]="HIGH" if best["score"]>=75 else ("MEDIUM" if best["score"]>=55 else "LOW")
@@ -336,12 +345,12 @@ async def main():
     for attempt in range(5):
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                text="XauBot Signal v20 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | RSI + Fibo | FVG 15M | OB 15M | M30 | Cooldown 30min | LIMIT AUTO | M5 REFINEMENT | FUTURES OFFSET +57.8$")
+                text="XauBot Signal v21 demarre\nScan 3min | Lun-Jeu 8h-19h UTC | Ven 8h-17h UTC | ADX 25 | FVG+OB M15 | M5 REFINEMENT | ENTRY_BUFFER +3$ | Cooldown 30min")
             break
         except Exception as e:
             log.error(f"Startup msg attempt {attempt+1}: {e}")
             await asyncio.sleep(10)
-    log.info("Bot demarre v20")
+    log.info("Bot demarre v21")
     while True:
         try:
             if not is_market_open():
@@ -351,7 +360,7 @@ async def main():
                 d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob,atr_v=xau
                 prev=last_signal["XAUUSD"]
                 elapsed=time.time()-prev["ts"]
-                same=(prev["direction"]==d)  # cooldown sur direction uniquement
+                same=(prev["direction"]==d)
                 if not same or elapsed>SIGNAL_COOLDOWN:
                     await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
                         text=format_message("XAUUSD",d,p,sl,tp1,tp2,tp3,v,htf,fib,fl,st,pat,rsiv,fvg,ob))
