@@ -70,10 +70,9 @@ def is_market_open():
     weekday = now.weekday()
     hour    = now.hour
     if weekday == 5: return False
-    if weekday == 6 and hour < 22: return False
-    if weekday == 4 and hour >= 21: return False
-    return True
-
+    if weekday == 6: return False
+    if weekday == 4 and hour >= 20: return False
+    return 7 <= hour < 20  # London + NY (7h-20h UTC)
 # ============================================================
 # DATA — async httpx (non-bloquant)
 # ============================================================
