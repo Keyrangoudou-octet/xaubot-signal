@@ -346,7 +346,7 @@ async def analyze_xauusd():
         return None
 
     m5 = await get_m5_confirmation(cfg["symbol"], direction)
-    if m5 is None or m5["score"] < 50:
+    if m5 is None or m5["score"] < 45:
         log.info("Signal rejeté : M5 faible")
         return None
 
