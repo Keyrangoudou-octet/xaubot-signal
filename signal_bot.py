@@ -1,15 +1,17 @@
-# XauBot — Signal Bot v23 PRO
-# Fixes vs v22 PRO :
-#   - requests remplacé par httpx async (plus de blocage event loop)
-#   - analyze_xauusd() rendu async (appels API non-bloquants)
-#   - check_zone_rejection() réintégré (confirmation SELL M5)
-#   - closed_df() conservé (anti-repainting)
-#   - Wilder RSI/ADX/ATR conservés
+# XauBot — Signal Bot v23.2 PRO
 #
-# Fixes v23.1 :
-#   - Filtre RSI dur : bloqué si RSI < 28 ou > 72 (extensions extrêmes)
-#   - M5 score minimum relevé 45 → 50
-#   - Horaire London+NY strict : 7h-20h UTC seulement (sam/dim fermés)
+# Fixes v23.2 :
+#   - get_structure() : BOS comparé aux bougies PRÉCÉDENTES (avant : impossible à déclencher)
+#   - Plantage SELL limit corrigé (DataFrame évalué en booléen)
+#   - M5 score minimum réellement à 50 (constante M5_MIN_SCORE)
+#   - Rejet SELL : plus d'annulation au moment du signal, ordre envoyé "⏳ en attente"
+#   - Fibonacci calculé selon la direction (SELL = retracement depuis le bas)
+#   - R:R calculé sur une vraie cible (swing high / swing low)
+#   - Filtre news / ouverture NY en heure de New York (gère l'heure d'été)
+#   - EMA 200 M30 : 500 bougies chargées
+#
+# Conservé de v23.1 : httpx async, closed_df (anti-repainting), Wilder RSI/ADX/ATR,
+#   filtre RSI extrême (<28 / >72), horaire 7h-20h UTC.
 
 import asyncio
 import logging
@@ -18,7 +20,8 @@ import time
 import httpx
 import pandas as pd
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
+from zoneinfo import ZoneInfo
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
@@ -30,10 +33,22 @@ SCAN_INTERVAL    = 180
 SIGNAL_COOLDOWN  = 1800
 FUTURES_OFFSET   = 0
 ENTRY_BUFFER     = 1.50
-MIN_CONFIDENCE   = 70
+MIN_CONFIDENCE   = 70      # tester 65 si toujours trop peu de signaux
+M5_MIN_SCORE     = 50
 REQUEST_TIMEOUT  = 15
 REJECT_RANGE     = 5.0
 REJECT_LOOKBACK  = 6
+
+# ── Filtre news (heure de New York, heure d'été gérée automatiquement) ──
+NY_TZ = ZoneInfo("America/New_York")
+NEWS_BLACKOUTS = [
+    (dtime(8, 25), dtime(8, 45)),   # stats US 8h30 ET (NFP, CPI, PPI, jobless claims...)
+    (dtime(9, 0),  dtime(9, 45)),   # ouverture New York
+]
+# Jours FOMC : bloque 13h55-14h45 ET (décision 14h00 + conférence 14h30).
+# Format "YYYY-MM-DD" — à compléter avec le calendrier officiel de la Fed.
+FOMC_DATES = set(filter(None, os.environ.get("FOMC_DATES", "").split(",")))
+FOMC_BLACKOUT = (dtime(13, 55), dtime(14, 45))
 
 XAUUSD_CONFIG = {
     "symbol":        "XAU/USD",
@@ -63,6 +78,17 @@ def is_market_open():
     if weekday == 6: return False
     if weekday == 4 and hour >= 20: return False
     return 7 <= hour < 20
+
+def in_news_blackout():
+    now_ny = datetime.now(NY_TZ)
+    t = now_ny.time()
+    for start, end in NEWS_BLACKOUTS:
+        if start <= t < end:
+            return True
+    if now_ny.strftime("%Y-%m-%d") in FOMC_DATES:
+        if FOMC_BLACKOUT[0] <= t < FOMC_BLACKOUT[1]:
+            return True
+    return False
 
 async def get_candles(symbol, interval="5min", outputsize=200):
     try:
@@ -121,11 +147,13 @@ def closed_df(df):
     return df.iloc[:-1].copy()
 
 def get_structure(df, lookback=20):
+    # FIX v23.2 : on compare le close actuel aux bougies PRÉCÉDENTES uniquement.
+    # Avant, la bougie actuelle était incluse → close > sa propre high impossible.
     if len(df) < lookback + 5: return None
-    recent  = df.tail(lookback)
-    current = float(recent["close"].iloc[-1])
-    if current > float(recent["high"].max()): return "BOS_BULL"
-    if current < float(recent["low"].min()):  return "BOS_BEAR"
+    prev    = df.iloc[-(lookback+1):-1]
+    current = float(df["close"].iloc[-1])
+    if current > float(prev["high"].max()): return "BOS_BULL"
+    if current < float(prev["low"].min()):  return "BOS_BEAR"
     return "RANGE"
 
 def double_impulse(df, atr_value):
@@ -206,10 +234,14 @@ def fibo_range(df, lookback=60):
     r = df.tail(lookback)
     return float(r["high"].max()), float(r["low"].min())
 
-def fibonacci_levels(high, low):
+def fibonacci_levels(high, low, direction):
+    # FIX v23.2 : BUY = retracement depuis le haut, SELL = retracement depuis le bas.
     d = high - low
     if d <= 0: return None
-    return {"38.2": round(high-d*0.382,2), "50.0": round(high-d*0.500,2), "61.8": round(high-d*0.618,2)}
+    r = {"38.2": .382, "50.0": .5, "61.8": .618}
+    if direction == "BUY":
+        return {k: round(high - d*v, 2) for k, v in r.items()}
+    return {k: round(low + d*v, 2) for k, v in r.items()}
 
 def check_zone_rejection(df5, entry, direction):
     n = len(df5)
@@ -223,7 +255,8 @@ def check_zone_rejection(df5, entry, direction):
     return False
 
 async def get_htf_analysis(symbol):
-    df = await get_candles(symbol, interval="30min", outputsize=250)
+    # FIX v23.2 : 500 bougies pour une EMA 200 fiable (1 crédit API quel que soit outputsize)
+    df = await get_candles(symbol, interval="30min", outputsize=500)
     if df is None: return None
     df = closed_df(df)
     if len(df) < 210: return None
@@ -316,7 +349,6 @@ async def analyze_xauusd():
     fvg              = detect_fvg(df, atr_v, min_atr_ratio=cfg["fvg_min_atr"])
     ob               = detect_ob(df, atr_v, impulse_mult=cfg["ob_impulse_atr"])
     swing_h, swing_l = fibo_range(df, cfg["fibo_lookback"])
-    fib              = fibonacci_levels(swing_h, swing_l)
 
     # ── Filtre RSI dur : extensions extrêmes ──────────────────
     if rsi_v < 28:
@@ -325,7 +357,6 @@ async def analyze_xauusd():
     if rsi_v > 72:
         log.info("Signal bloqué : RSI extrême haut %.1f (overbought)", rsi_v)
         return None
-    # ──────────────────────────────────────────────────────────
 
     buy_ok  = (htf in ("BULL","BULL_STRONG") and ef > es and pdi_v > mdi_v
                and adx_v >= cfg["adx_min"]
@@ -335,19 +366,25 @@ async def analyze_xauusd():
                and (bear_imp or breakout == "BEAR" or structure == "BOS_BEAR"))
 
     direction = "BUY" if buy_ok else ("SELL" if sell_ok else None)
-    if direction is None: return None
+    if direction is None:
+        log.info("Pas de setup (htf=%s ef>es=%s +DI>-DI=%s adx=%.1f struct=%s brk=%s)",
+                 htf, ef > es, pdi_v > mdi_v, adx_v, structure, breakout)
+        return None
+
+    # FIX v23.2 : Fibo calculé selon la direction
+    fib = fibonacci_levels(swing_h, swing_l, direction)
 
     confidence, reasons = calculate_confidence(
         direction, htf, ef, es, price, pdi_v, mdi_v, adx_v, rsi_v,
         pattern, fvg, ob, structure, breakout)
 
     if confidence < MIN_CONFIDENCE:
-        log.info("Signal rejeté : confidence %s", confidence)
+        log.info("Signal %s rejeté : confidence %s < %s", direction, confidence, MIN_CONFIDENCE)
         return None
 
     m5 = await get_m5_confirmation(cfg["symbol"], direction)
-    if m5 is None or m5["score"] < 45:
-        log.info("Signal rejeté : M5 faible")
+    if m5 is None or m5["score"] < M5_MIN_SCORE:
+        log.info("Signal %s rejeté : M5 faible (%s)", direction, m5["score"] if m5 else None)
         return None
 
     stop_distance = atr_v * 1.5
@@ -364,7 +401,8 @@ async def analyze_xauusd():
         "adx": round(adx_v,1), "pdi": round(pdi_v,1), "mdi": round(mdi_v,1),
         "rsi": round(rsi_v,1), "htf": htf, "pattern": pattern,
         "structure": structure, "breakout": breakout, "fvg": fvg, "ob": ob,
-        "fib": fib, "atr": atr_v, "confidence": confidence, "reasons": reasons,
+        "fib": fib, "swing_h": swing_h, "swing_l": swing_l,
+        "atr": atr_v, "confidence": confidence, "reasons": reasons,
         "m5_score": m5["score"], "m5_pattern": m5["pattern"], "m5_df5": m5["df5"],
         "signal_type": "BREAKOUT_CONF" if breakout else "SIGNAL",
     }
@@ -397,9 +435,16 @@ def calc_limit_entry(signal):
     best  = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
     entry = best["limit"]; sl = best["sl"]; risk = abs(entry-sl)
     if risk <= 0: return None
-    rr = abs((entry+risk*2.5 if direction=="BUY" else entry-risk*2.5) - entry) / risk
-    if rr < XAUUSD_CONFIG["min_rr"]: return None
-    best["rr"] = round(rr,2); best["confidence"] = "HIGH" if best["score"]>=70 else "MEDIUM"
+
+    # FIX v23.2 : R:R mesuré sur une vraie cible structurelle (swing high / swing low)
+    target = signal["swing_h"] if direction == "BUY" else signal["swing_l"]
+    reward = (target - entry) if direction == "BUY" else (entry - target)
+    rr = reward / risk
+    if rr < XAUUSD_CONFIG["min_rr"]:
+        log.info("Limit %s @ %s rejeté : R:R %.2f vers cible %.2f", direction, entry, rr, target)
+        return None
+    best["rr"] = round(rr,2); best["target"] = round(target,2)
+    best["confidence"] = "HIGH" if best["score"]>=70 else "MEDIUM"
     return best
 
 def format_message(signal):
@@ -448,11 +493,12 @@ def format_limit_message(signal, limit, sell_rejected=False):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📐 Source : {limit['source']}\n"
         f"🔥 Confluence : {', '.join(limit['confluence']) or 'FIBO'}\n"
-        f"📊 Score zone : {limit['score']}/100\n⚖️ RR potentiel : {limit['rr']}\n"
+        f"📊 Score zone : {limit['score']}/100\n"
+        f"⚖️ RR vers {'swing high' if d=='BUY' else 'swing low'} ({limit['target']}) : {limit['rr']}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
     )
     if d == "SELL":
-        msg += "🕯 Rejet M5 : ✅ confirmé\n" if sell_rejected else "🕯 Rejet M5 : ⏳ en attente\n"
+        msg += "🕯 Rejet M5 : ✅ confirmé\n" if sell_rejected else "🕯 Rejet M5 : ⏳ en attente — attends une bougie M5 baissière dans la zone\n"
     msg += "⏳ Invalidation : annuler après 12 bougies M15"
     return msg
 
@@ -472,29 +518,35 @@ async def main():
     for attempt in range(5):
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=(
-                "🚀 XauBot Signal v23.1 PRO démarré\n\n"
+                "🚀 XauBot Signal v23.2 PRO démarré\n\n"
                 "📊 M30 → tendance | M15 → structure | M5 → confirmation\n\n"
-                "✅ Fixes v23.1 :\n"
-                "• RSI extrême bloqué (< 28 / > 72)\n"
-                "• M5 score minimum 50/80\n"
-                "• Horaire strict 7h-20h UTC (London+NY)\n"
-                "• httpx async (plus de freeze)\n"
-                "• Anti-repainting (closed_df)\n"
-                "• SELL confirmation rejet M5\n"
-                "• Wilder RSI/ADX/ATR\n"
-                "🎯 Score minimum : 70/100"
+                "✅ Fixes v23.2 :\n"
+                "• Break of Structure réparé\n"
+                "• Plantage ordre limit SELL corrigé\n"
+                f"• M5 score minimum {M5_MIN_SCORE}/80\n"
+                "• Ordres SELL limit envoyés (rejet M5 en attente)\n"
+                "• Fibonacci selon la direction\n"
+                "• R:R sur vraie cible (swing)\n"
+                "• Filtre news + ouverture NY (heure de New York)\n"
+                "• EMA 200 M30 sur 500 bougies\n"
+                f"🎯 Score minimum : {MIN_CONFIDENCE}/100"
             ))
             break
         except Exception as e:
             log.error("Startup: %s", e)
             await asyncio.sleep(10)
 
-    log.info("XauBot v23.1 PRO démarré")
+    log.info("XauBot v23.2 PRO démarré")
 
     while True:
         try:
             if not is_market_open():
                 log.info("Marché fermé")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+
+            if in_news_blackout():
+                log.info("Fenêtre news / ouverture NY : pas de scan")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
@@ -510,17 +562,13 @@ async def main():
                 if limit:
                     sell_rejected = False
                     if signal["direction"] == "SELL":
-                        df5 = signal.get("m5_df5") or await get_candles(
-                            XAUUSD_CONFIG["symbol"], interval="5min", outputsize=20)
+                        # FIX v23.2 : plus de "df or ..." sur un DataFrame
+                        df5 = signal.get("m5_df5")
+                        if df5 is None:
+                            df5 = await get_candles(XAUUSD_CONFIG["symbol"], interval="5min", outputsize=20)
                         if df5 is not None:
                             sell_rejected = check_zone_rejection(df5, limit["limit"], "SELL")
-                            if not sell_rejected:
-                                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=(
-                                    f"⚠️ XAUUSD — Zone SELL @ {limit['limit']} détectée mais pas de rejet M5\n"
-                                    f"Ordre limit annulé — attends une bougie baissière dans la zone"
-                                ))
-                                await asyncio.sleep(SCAN_INTERVAL)
-                                continue
+                        # FIX v23.2 : plus d'annulation, l'ordre part avec "⏳ en attente"
                     limit_msg = format_limit_message(signal, limit, sell_rejected)
                     if limit_msg:
                         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=limit_msg)
@@ -532,6 +580,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
