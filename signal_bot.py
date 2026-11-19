@@ -1,17 +1,21 @@
-# XauBot — Signal Bot v23.2 PRO
+# XauBot — Signal Bot v23.3 SNIPER
 #
-# Fixes v23.2 :
-#   - get_structure() : BOS comparé aux bougies PRÉCÉDENTES (avant : impossible à déclencher)
-#   - Plantage SELL limit corrigé (DataFrame évalué en booléen)
-#   - M5 score minimum réellement à 50 (constante M5_MIN_SCORE)
-#   - Rejet SELL : plus d'annulation au moment du signal, ordre envoyé "⏳ en attente"
-#   - Fibonacci calculé selon la direction (SELL = retracement depuis le bas)
-#   - R:R calculé sur une vraie cible (swing high / swing low)
-#   - Filtre news / ouverture NY en heure de New York (gère l'heure d'été)
-#   - EMA 200 M30 : 500 bougies chargées
+# Nouveau v23.3 (la logique de détection des setups M30/M15/M5 est INCHANGÉE) :
+#   - Scan calé sur la clôture de chaque bougie M5 (+20 s) au lieu de "toutes les 3 min"
+#     → le signal part quelques secondes après la bougie, pas 3 min après
+#   - Mode SNIPER : le setup M15 n'est plus un ordre d'entrée immédiat.
+#       1) "🟡 SETUP" : direction validée, prépare-toi
+#       2) "🎯 ENTRE MAINTENANT" : quand une bougie M5 fait un pullback vers l'EMA20 M5
+#          puis se referme dans le sens du trade (rejet)
+#       SL serré derrière le pullback M5, TP = mêmes niveaux que le setup → meilleur R:R
+#       Annulé si : SL du setup touché, TP1 atteint sans pullback (raté), ou 6 bougies M5 sans entrée
+#   - Mode DIRECT (ENTRY_MODE=DIRECT) : comportement v23.2, mais SL/TP recalculés sur le prix live
+#   - Prix live au moment de l'envoi + alerte "TROP TARD"
+#   - Messages ORDRE LIMIT désactivés par défaut (SEND_LIMIT)
+#   - Tendance M30 mise en cache 15 min → beaucoup moins de crédits Twelve Data
 #
-# Conservé de v23.1 : httpx async, closed_df (anti-repainting), Wilder RSI/ADX/ATR,
-#   filtre RSI extrême (<28 / >72), horaire 7h-20h UTC.
+# Conservé de v23.2 : BOS corrigé, Fibonacci selon la direction, R:R sur swing, filtre news NY,
+#   closed_df (anti-repainting), Wilder RSI/ADX/ATR, filtre RSI extrême, horaire 7h-20h UTC.
 
 import asyncio
 import logging
@@ -29,7 +33,6 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL    = 180
 SIGNAL_COOLDOWN  = 1800
 FUTURES_OFFSET   = 0
 ENTRY_BUFFER     = 1.50
@@ -38,6 +41,17 @@ M5_MIN_SCORE     = 50
 REQUEST_TIMEOUT  = 15
 REJECT_RANGE     = 5.0
 REJECT_LOOKBACK  = 6
+
+# ── v23.3 : entrée ──────────────────────────────────────────────
+ENTRY_MODE       = os.environ.get("ENTRY_MODE", "SNIPER").upper()   # SNIPER ou DIRECT
+SEND_LIMIT       = False   # True pour réactiver les messages ORDRE LIMIT
+SCAN_OFFSET_SEC  = 20      # secondes après la clôture M5 avant de scanner
+ENTRY_WINDOW_M5  = 6       # bougies M5 max pour trouver l'entrée (30 min)
+PULLBACK_ATR     = 0.25    # le pullback doit revenir à moins de 0.25 ATR M5 de l'EMA20 M5
+SL_BUFFER_ATR    = 0.30    # marge du SL au-delà du sommet/creux du pullback (en ATR M15)
+SL_MIN_ATR       = 0.50    # SL jamais plus serré que 0.5 ATR M15 (bruit)
+TOO_LATE_R       = 0.50    # "trop tard" si le prix a déjà fait 50 % du chemin vers TP1
+HTF_CACHE_SEC    = 900     # tendance M30 rafraîchie toutes les 15 min
 
 # ── Filtre news (heure de New York, heure d'été gérée automatiquement) ──
 NY_TZ = ZoneInfo("America/New_York")
@@ -326,7 +340,7 @@ def calculate_confidence(direction, htf, ef, es, price,
 async def analyze_xauusd():
     cfg = XAUUSD_CONFIG
     htf, df = await asyncio.gather(
-        get_htf_analysis(cfg["symbol"]),
+        get_htf_cached(cfg["symbol"]),
         get_candles(cfg["symbol"], interval="15min", outputsize=200),
     )
     if not htf or df is None: return None
@@ -447,35 +461,160 @@ def calc_limit_entry(signal):
     best["confidence"] = "HIGH" if best["score"]>=70 else "MEDIUM"
     return best
 
-def format_message(signal):
+
+# ══════════════════════════════════════════════════════════════
+#  v23.3 — cache M30, prix live, mode SNIPER
+# ══════════════════════════════════════════════════════════════
+
+_htf_cache = {"value": None, "ts": 0}
+
+async def get_htf_cached(symbol):
+    if _htf_cache["value"] and time.time() - _htf_cache["ts"] < HTF_CACHE_SEC:
+        return _htf_cache["value"]
+    value = await get_htf_analysis(symbol)
+    if value:
+        _htf_cache["value"], _htf_cache["ts"] = value, time.time()
+    return value
+
+async def get_live_price(symbol):
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get("https://api.twelvedata.com/price",
+                                 params={"symbol": symbol, "apikey": TWELVE_API_KEY})
+            return float(r.json()["price"])
+    except Exception as e:
+        log.error("get_live_price %s: %s", symbol, e)
+        return None
+
+def seconds_to_next_m5():
+    now = time.time()
+    nxt = (int(now) // 300 + 1) * 300 + SCAN_OFFSET_SEC
+    return max(5, nxt - now)
+
+def sniper_trigger(signal, df5):
+    """Cherche le pullback + rejet sur la dernière bougie M5 fermée.
+    Retourne ("ENTRY", sl) / ("INVALID", raison) / ("MISSED", raison) / (None, None)."""
+    d     = signal["direction"]
+    sens  = 1 if d == "BUY" else -1
+    risk0 = abs(signal["price"] - signal["sl"])
+    df5   = df5.copy()
+    df5["ema20"] = ema(df5["close"], 20)
+    atr5  = float(atr(df5).iloc[-1])
+    last  = df5.iloc[-1]
+    recent = df5.iloc[-3:]
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    e20 = float(last["ema20"])
+
+    # 1) Invalidation : le prix a franchi le SL du setup
+    if (d == "SELL" and h >= signal["sl"]) or (d == "BUY" and l <= signal["sl"]):
+        return "INVALID", "SL du setup touché avant l'entrée"
+    # 2) Raté : TP1 déjà atteint sans pullback
+    if (d == "SELL" and l <= signal["tp1"]) or (d == "BUY" and h >= signal["tp1"]):
+        return "MISSED", "TP1 atteint sans pullback — ne cours pas après le prix"
+
+    # 3) Pullback : une des 3 dernières bougies est revenue vers l'EMA20 M5
+    if d == "SELL":
+        pullback = float(recent["high"].max()) >= float(recent["ema20"].min()) - PULLBACK_ATR * atr5
+    else:
+        pullback = float(recent["low"].min()) <= float(recent["ema20"].max()) + PULLBACK_ATR * atr5
+    # 4) Rejet : bougie fermée dans le sens du trade, sous/au-dessus de l'EMA20
+    pattern = detect_pattern(df5)
+    if d == "SELL":
+        rejection = (c < o and c < e20) or pattern in ("PIN_BEAR", "ENGULFING_BEAR")
+    else:
+        rejection = (c > o and c > e20) or pattern in ("PIN_BULL", "ENGULFING_BULL")
+    # 5) Pas trop tard : le prix n'a pas déjà fait la moitié du chemin vers TP1
+    travelled = (signal["price"] - c) * (1 if d == "SELL" else -1)
+    too_late = travelled >= risk0 * TOO_LATE_R
+
+    if not (pullback and rejection) or too_late:
+        return None, None
+
+    # SL chirurgical : derrière le pullback, borné entre SL_MIN_ATR et le SL du setup
+    atr15 = signal["atr"]
+    if d == "SELL":
+        sl = float(recent["high"].max()) + SL_BUFFER_ATR * atr15
+        sl = max(sl, c + SL_MIN_ATR * atr15)
+        sl = min(sl, signal["sl"])
+    else:
+        sl = float(recent["low"].min()) - SL_BUFFER_ATR * atr15
+        sl = min(sl, c - SL_MIN_ATR * atr15)
+        sl = max(sl, signal["sl"])
+    return "ENTRY", round(sl, 2)
+
+def format_setup_message(signal):
     d = signal["direction"]
-    icon = "🟢" if signal["confidence"] >= 85 else "🟡"
-    now  = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    msg  = (
-        f"{'🟢' if d=='BUY' else '🔴'} SIGNAL {d} — XAUUSD\n"
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    return (
+        f"🟡 SETUP {d} — XAUUSD\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now}\n"
-        f"📍 Entry : {signal['price']}\n"
-        f"🛑 SL    : {signal['sl']}\n"
+        f"📍 Prix setup : {signal['price']}\n"
+        f"🛑 Invalidation : {signal['sl']}\n"
+        f"🎯 Objectifs : {signal['tp1']} / {signal['tp2']} / {signal['tp3']}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 TP1   : {signal['tp1']} (1R)\n"
-        f"🎯 TP2   : {signal['tp2']} (1.5R)\n"
-        f"🎯 TP3   : {signal['tp3']} (2.5R)\n"
+        f"🧭 M30 : {signal['htf']} | 🔬 M5 : {signal['m5_score']}/80\n"
+        f"🟢 CONFIANCE : {signal['confidence']}/100\n"
+        f"✅ " + " | ".join(signal["reasons"]) + "\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 ADX   : {signal['adx']}\n"
-        f"📈 +DI   : {signal['pdi']}\n"
-        f"📉 -DI   : {signal['mdi']}\n"
-        f"📉 RSI   : {signal['rsi']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧭 M30   : {signal['htf']}\n"
-        f"🏗 Structure : {signal['structure']}\n"
-        f"🔬 M5 score  : {signal['m5_score']}/80\n"
+        f"⏳ NE RENTRE PAS ENCORE — j'attends un pullback M5\n"
+        f"et je t'envoie « 🎯 ENTRE MAINTENANT » (max {ENTRY_WINDOW_M5*5} min)"
     )
-    if signal["pattern"]:    msg += f"🕯 Pattern M15 : {signal['pattern']}\n"
-    if signal["m5_pattern"]: msg += f"🕯 Pattern M5  : {signal['m5_pattern']}\n"
-    if signal["fvg"]:        msg += f"📐 FVG : {signal['fvg'][0]} [{signal['fvg'][1]} - {signal['fvg'][2]}]\n"
-    if signal["ob"]:         msg += f"📦 OB  : {signal['ob'][0]} [{signal['ob'][1]} - {signal['ob'][2]}]\n"
-    msg += f"━━━━━━━━━━━━━━━━━━\n{icon} CONFIANCE : {signal['confidence']}/100\n"
+
+def format_entry_message(signal, entry, sl, live=None):
+    d = signal["direction"]
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    px = live if live else entry
+    risk = abs(px - sl)
+    def rr(tp): return round(abs(tp - px) / risk, 2) if risk > 0 else 0
+    msg = (
+        f"🎯 ENTRE MAINTENANT — {('🟢 BUY' if d=='BUY' else '🔴 SELL')} XAUUSD\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {now}\n"
+        f"⚡ Prix : {round(px,2)}" + (" (live)" if live else " (clôture M5)") + "\n"
+        f"🛑 SL   : {sl}  ({round(risk,2)} $)\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 TP1  : {signal['tp1']} (R:R {rr(signal['tp1'])}) → sécurise 50 % + SL à l'entrée\n"
+        f"🎯 TP2  : {signal['tp2']} (R:R {rr(signal['tp2'])})\n"
+        f"🎯 TP3  : {signal['tp3']} (R:R {rr(signal['tp3'])})\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🕯 Pullback M5 vers EMA20 + bougie de rejet confirmée"
+    )
+    if live:
+        sens = 1 if d == "BUY" else -1
+        if (live - entry) * sens >= risk * TOO_LATE_R:
+            msg += "\n⚠️ Le prix a déjà bougé depuis la clôture M5 — vérifie avant d'entrer"
+    return msg
+
+def format_direct_message(signal, live=None):
+    d    = signal["direction"]
+    icon = "🟢" if signal["confidence"] >= 85 else "🟡"
+    now  = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    risk = abs(signal["price"] - signal["sl"])
+    sens = 1 if d == "BUY" else -1
+    entry = live if live else signal["price"]
+    sl, tp1 = entry - sens*risk, entry + sens*risk
+    tp2, tp3 = entry + sens*risk*1.5, entry + sens*risk*2.5
+    msg = (f"{'🟢' if d=='BUY' else '🔴'} SIGNAL {d} — XAUUSD\n━━━━━━━━━━━━━━━━━━\n🕐 {now}\n")
+    if live:
+        moved = (live - signal["price"]) * sens
+        msg += (f"📍 Prix signal : {signal['price']}\n"
+                f"⚡ Prix ACTUEL : {round(live,2)} ({'+' if moved>=0 else ''}{round(moved,2)} $)\n")
+        if moved >= risk * TOO_LATE_R:
+            msg += "⚠️ TROP TARD — le prix est déjà parti, ne rentre pas\n"
+    else:
+        msg += f"📍 Entry : {signal['price']} (prix live indisponible)\n"
+    msg += (
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛑 SL    : {round(sl,2)}  ({round(risk,2)} $)\n"
+        f"🎯 TP1   : {round(tp1,2)} (1R) → sécurise 50 % + SL à l'entrée\n"
+        f"🎯 TP2   : {round(tp2,2)} (1.5R)\n"
+        f"🎯 TP3   : {round(tp3,2)} (2.5R)\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 ADX {signal['adx']} | +DI {signal['pdi']} | -DI {signal['mdi']} | RSI {signal['rsi']}\n"
+        f"🧭 M30 : {signal['htf']} | 🏗 {signal['structure']} | 🔬 M5 {signal['m5_score']}/80\n"
+        f"━━━━━━━━━━━━━━━━━━\n{icon} CONFIANCE : {signal['confidence']}/100\n"
+    )
     if signal["reasons"]: msg += "✅ " + " | ".join(signal["reasons"])
     return msg
 
@@ -503,6 +642,7 @@ def format_limit_message(signal, limit, sell_rejected=False):
     return msg
 
 last_signal = {"XAUUSD": {"direction": None, "price": None, "ts": 0}}
+pending = {"signal": None, "candles_left": 0}
 
 def should_send_signal(signal):
     prev    = last_signal["XAUUSD"]
@@ -512,23 +652,52 @@ def should_send_signal(signal):
     if prev["price"] and abs(signal["price"]-prev["price"]) >= signal["atr"]*1.5: return True
     return False
 
+async def send(bot, text):
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        log.error("Telegram: %s", e)
+
+async def manage_pending(bot):
+    """Appelé à chaque clôture M5 tant qu'un setup SNIPER attend son entrée."""
+    sig = pending["signal"]
+    df5 = await get_candles(XAUUSD_CONFIG["symbol"], interval="5min", outputsize=60)
+    df5 = closed_df(df5)
+    if df5 is None or len(df5) < 25:
+        return
+    status, info = sniper_trigger(sig, df5)
+    if status == "ENTRY":
+        live = await get_live_price(XAUUSD_CONFIG["symbol"])
+        entry = float(df5["close"].iloc[-1])
+        await send(bot, format_entry_message(sig, entry, info, live))
+        log.info("SNIPER %s : entrée envoyée (SL %s)", sig["direction"], info)
+        pending["signal"] = None
+        return
+    if status in ("INVALID", "MISSED"):
+        icon = "❌" if status == "INVALID" else "⏭"
+        await send(bot, f"{icon} SETUP {sig['direction']} ANNULÉ — {info}")
+        pending["signal"] = None
+        return
+    pending["candles_left"] -= 1
+    if pending["candles_left"] <= 0:
+        await send(bot, f"⌛ SETUP {sig['direction']} EXPIRÉ — pas de bon point d'entrée en {ENTRY_WINDOW_M5*5} min, on laisse passer")
+        pending["signal"] = None
+
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN,
               request=HTTPXRequest(read_timeout=30, connect_timeout=30, write_timeout=30))
     for attempt in range(5):
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=(
-                "🚀 XauBot Signal v23.2 PRO démarré\n\n"
-                "📊 M30 → tendance | M15 → structure | M5 → confirmation\n\n"
-                "✅ Fixes v23.2 :\n"
-                "• Break of Structure réparé\n"
-                "• Plantage ordre limit SELL corrigé\n"
-                f"• M5 score minimum {M5_MIN_SCORE}/80\n"
-                "• Ordres SELL limit envoyés (rejet M5 en attente)\n"
-                "• Fibonacci selon la direction\n"
-                "• R:R sur vraie cible (swing)\n"
-                "• Filtre news + ouverture NY (heure de New York)\n"
-                "• EMA 200 M30 sur 500 bougies\n"
+                "🚀 XauBot Signal v23.3 démarré\n\n"
+                f"🎯 Mode d'entrée : {ENTRY_MODE}\n"
+                "📊 M30 → tendance | M15 → setup | M5 → entrée\n\n"
+                "✅ Nouveau v23.3 :\n"
+                "• Scan à chaque clôture M5 (+20 s)\n"
+                "• SNIPER : 🟡 SETUP puis 🎯 ENTRE MAINTENANT sur pullback M5\n"
+                "• SL serré derrière le pullback, mêmes TP\n"
+                "• Prix live + alerte TROP TARD\n"
+                "• Ordres limit désactivés\n"
                 f"🎯 Score minimum : {MIN_CONFIDENCE}/100"
             ))
             break
@@ -536,47 +705,58 @@ async def main():
             log.error("Startup: %s", e)
             await asyncio.sleep(10)
 
-    log.info("XauBot v23.2 PRO démarré")
+    log.info("XauBot v23.3 démarré (mode %s)", ENTRY_MODE)
 
     while True:
+        await asyncio.sleep(seconds_to_next_m5())
         try:
             if not is_market_open():
+                if pending["signal"]:
+                    await send(bot, f"⌛ SETUP {pending['signal']['direction']} EXPIRÉ — marché fermé")
+                    pending["signal"] = None
                 log.info("Marché fermé")
-                await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
             if in_news_blackout():
                 log.info("Fenêtre news / ouverture NY : pas de scan")
-                await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
+            # 1) Un setup attend son entrée → on surveille seulement le M5
+            if pending["signal"]:
+                await manage_pending(bot)
+                continue
+
+            # 2) Recherche d'un nouveau setup (logique v23.2 inchangée)
             signal = await analyze_xauusd()
+            if not (signal and should_send_signal(signal)):
+                continue
 
-            if signal and should_send_signal(signal):
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_message(signal))
-                last_signal["XAUUSD"] = {"direction": signal["direction"],
-                                          "price": signal["price"], "ts": time.time()}
-                await asyncio.sleep(2)
+            last_signal["XAUUSD"] = {"direction": signal["direction"],
+                                      "price": signal["price"], "ts": time.time()}
 
+            if ENTRY_MODE == "SNIPER":
+                await send(bot, format_setup_message(signal))
+                pending["signal"] = signal
+                pending["candles_left"] = ENTRY_WINDOW_M5
+            else:
+                live = await get_live_price(XAUUSD_CONFIG["symbol"])
+                await send(bot, format_direct_message(signal, live))
+
+            if SEND_LIMIT:
                 limit = calc_limit_entry(signal)
                 if limit:
                     sell_rejected = False
                     if signal["direction"] == "SELL":
-                        # FIX v23.2 : plus de "df or ..." sur un DataFrame
                         df5 = signal.get("m5_df5")
-                        if df5 is None:
-                            df5 = await get_candles(XAUUSD_CONFIG["symbol"], interval="5min", outputsize=20)
                         if df5 is not None:
                             sell_rejected = check_zone_rejection(df5, limit["limit"], "SELL")
-                        # FIX v23.2 : plus d'annulation, l'ordre part avec "⏳ en attente"
                     limit_msg = format_limit_message(signal, limit, sell_rejected)
                     if limit_msg:
-                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=limit_msg)
+                        await asyncio.sleep(2)
+                        await send(bot, limit_msg)
 
         except Exception as e:
             log.exception("Erreur principale: %s", e)
-
-        await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())
