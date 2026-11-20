@@ -582,7 +582,7 @@ def format_entry_message(signal, entry, sl, live=None):
     )
     if live:
         sens = 1 if d == "BUY" else -1
-        if (live - entry) * sens >= risk * TOO_LATE_R:
+        if (live - entry) * sens >= abs(entry - sl) * TOO_LATE_R:
             msg += "\n⚠️ Le prix a déjà bougé depuis la clôture M5 — vérifie avant d'entrer"
     return msg
 
