@@ -1,21 +1,24 @@
-# XauBot — Signal Bot v23.3 SNIPER
+# ══════════════════════════════════════════════════════════════
+# XauBot — Signal Bot v25 REBOND + TENDANCE
 #
-# Nouveau v23.3 (la logique de détection des setups M30/M15/M5 est INCHANGÉE) :
-#   - Scan calé sur la clôture de chaque bougie M5 (+20 s) au lieu de "toutes les 3 min"
-#     → le signal part quelques secondes après la bougie, pas 3 min après
-#   - Mode SNIPER : le setup M15 n'est plus un ordre d'entrée immédiat.
-#       1) "🟡 SETUP" : direction validée, prépare-toi
-#       2) "🎯 ENTRE MAINTENANT" : quand une bougie M5 fait un pullback vers l'EMA20 M5
-#          puis se referme dans le sens du trade (rejet)
-#       SL serré derrière le pullback M5, TP = mêmes niveaux que le setup → meilleur R:R
-#       Annulé si : SL du setup touché, TP1 atteint sans pullback (raté), ou 6 bougies M5 sans entrée
-#   - Mode DIRECT (ENTRY_MODE=DIRECT) : comportement v23.2, mais SL/TP recalculés sur le prix live
-#   - Prix live au moment de l'envoi + alerte "TROP TARD"
-#   - Messages ORDRE LIMIT désactivés par défaut (SEND_LIMIT)
-#   - Tendance M30 mise en cache 15 min → beaucoup moins de crédits Twelve Data
+# 2 stratégies, 1 seul trade à la fois (choisies par backtest, bougies réelles Vantage oct-nov 2026) :
 #
-# Conservé de v23.2 : BOS corrigé, Fibonacci selon la direction, R:R sur swing, filtre news NY,
-#   closed_df (anti-repainting), Wilder RSI/ADX/ATR, filtre RSI extrême, horaire 7h-20h UTC.
+#  ☀️ MATIN 7h-12h UTC (8h-13h Paris) — REBOND (≈ 87 % de trades gagnants au backtest)
+#   - Tendance M15 : EMA20 > EMA50 → BUY seulement, EMA20 < EMA50 → SELL seulement
+#   - Bougie M5 qui touche l'EMA20 M5 et la REJETTE : mèche ≥ 60 % de la bougie,
+#     clôture du bon côté de l'EMA → « 🎯 ENTRE MAINTENANT »
+#   - TP = 1.5 ATR M5 | SL = 3 ATR M5 (TP ≈ 0.5 R : beaucoup de petits gains)
+#
+#  🌙 APRÈS-MIDI / SOIR 12h-20h UTC (13h-21h Paris) — TENDANCE NY (v24, inchangée) :
+#   - Tendance : M30 (EMA 20/50) + M15 (EMA 20/50, ADX ≥ 20, +DI/-DI, RSI 28-72) alignés
+#   - Pullback : les 5 dernières bougies M5 ont clôturé du bon côté de l'EMA20 M5,
+#     puis le prix revient TOUCHER l'EMA20 M5 → « 🎯 ENTRE MAINTENANT » (prix live)
+#   - SL = 0.8 ATR M15 | TP unique = 1.5 R | on ne touche plus au SL
+#   - Session New York uniquement : 12h-20h UTC (13h-21h Paris en hiver)
+#   - Max 3 trades par jour, 1 seul trade à la fois
+#   - Le bot suit le trade et annonce ✅ TP / ❌ SL (pour le journal)
+#   - Signaux uniquement : le bot ne passe AUCUN ordre
+# ══════════════════════════════════════════════════════════════
 
 import asyncio
 import logging
@@ -33,730 +36,387 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SIGNAL_COOLDOWN  = 1800
-FUTURES_OFFSET   = 0
-ENTRY_BUFFER     = 1.50
-MIN_CONFIDENCE   = 70      # tester 65 si toujours trop peu de signaux
-M5_MIN_SCORE     = 50
+SYMBOL           = "XAU/USD"
 REQUEST_TIMEOUT  = 15
-REJECT_RANGE     = 5.0
-REJECT_LOOKBACK  = 6
+SCAN_OFFSET_SEC  = 20      # scan 20 s après chaque clôture M5
 
-# ── v23.3 : entrée ──────────────────────────────────────────────
-ENTRY_MODE       = os.environ.get("ENTRY_MODE", "SNIPER").upper()   # SNIPER ou DIRECT
-SEND_LIMIT       = False   # True pour réactiver les messages ORDRE LIMIT
-SCAN_OFFSET_SEC  = 20      # secondes après la clôture M5 avant de scanner
-ENTRY_WINDOW_M5  = 6       # bougies M5 max pour trouver l'entrée (30 min)
-PULLBACK_ATR     = 0.25    # le pullback doit revenir à moins de 0.25 ATR M5 de l'EMA20 M5
-SL_BUFFER_ATR    = 0.30    # marge du SL au-delà du sommet/creux du pullback (en ATR M15)
-SL_MIN_ATR       = 0.50    # SL jamais plus serré que 0.5 ATR M15 (bruit)
-TOO_LATE_R       = 0.50    # "trop tard" si le prix a déjà fait 50 % du chemin vers TP1
-HTF_CACHE_SEC    = 900     # tendance M30 rafraîchie toutes les 15 min
+# ── Stratégie (valeurs du backtest) ─────────────────────────────
+ADX_MIN          = 20
+RSI_MIN, RSI_MAX = 28, 72
+EMA_M5           = 20
+AWAY_BARS        = 5       # bougies M5 du bon côté de l'EMA avant le retour
+SL_ATR           = 0.80    # SL = 0.8 ATR M15
+TP_R             = 1.5     # TP unique à 1.5 R
+MAX_TRADES_DAY   = int(os.environ.get("MAX_TRADES_DAY", "3"))
+SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", "12"))
+SESSION_END_UTC  = 20
+MAX_HOLD_SEC     = 24 * 3600
+MISSED_TOUCH_ATR = 0.30    # touche ratée entre 2 vérifs : entrée seulement si le prix est encore proche
+RISK_EUR         = float(os.environ.get("RISK_EUR", "150"))
 
-# ── Filtre news (heure de New York, heure d'été gérée automatiquement) ──
+# ── REBOND du matin ─────────────────────────────────────────────
+REB_START_UTC    = int(os.environ.get("REB_START_UTC", "7"))
+REB_END_UTC      = 12
+REB_WICK         = 0.60    # mèche ≥ 60 % de la bougie
+REB_TP_ATR       = 1.5     # TP = 1.5 ATR M5
+REB_SL_ATR       = 3.0     # SL = 3 ATR M5
+REB_MAX_DAY      = 3
+
+# ── Crédits Twelve Data (offre gratuite : 800/jour, 8/min) ──────
+POLL_SEC         = 30      # prix live toutes les 30 s pendant l'attente
+POLL_NEAR_ATR    = 1.0     # on ne surveille en direct que si le prix est à < 1 ATR de l'EMA
+CREDIT_BUDGET    = 760     # au-delà, plus de surveillance live (scan M5 seulement)
+HTF_CACHE_SEC    = 900
+
 NY_TZ = ZoneInfo("America/New_York")
 NEWS_BLACKOUTS = [
-    (dtime(8, 25), dtime(8, 45)),   # stats US 8h30 ET (NFP, CPI, PPI, jobless claims...)
+    (dtime(8, 25), dtime(8, 45)),   # stats US 8h30 ET (NFP, CPI…)
     (dtime(9, 0),  dtime(9, 45)),   # ouverture New York
 ]
-# Jours FOMC : bloque 13h55-14h45 ET (décision 14h00 + conférence 14h30).
-# Format "YYYY-MM-DD" — à compléter avec le calendrier officiel de la Fed.
 FOMC_DATES = set(filter(None, os.environ.get("FOMC_DATES", "").split(",")))
 FOMC_BLACKOUT = (dtime(13, 55), dtime(14, 45))
-
-XAUUSD_CONFIG = {
-    "symbol":        "XAU/USD",
-    "label":         "XAUUSD",
-    "ema_fast":      20,
-    "ema_slow":      50,
-    "ema_trend":     200,
-    "adx_period":    14,
-    "adx_min":       23,
-    "rsi_period":    14,
-    "atr_period":    14,
-    "swing_lookback":20,
-    "fibo_lookback": 60,
-    "min_rr":        1.5,
-    "fvg_min_atr":   0.15,
-    "ob_impulse_atr":1.2,
-}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-def is_market_open():
-    now     = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour    = now.hour
-    if weekday == 5: return False
-    if weekday == 6: return False
-    if weekday == 4 and hour >= 20: return False
-    return 7 <= hour < 20
+state = {
+    "trade": None,                 # trade en cours suivi par le bot
+    "day": None, "count": 0, "count_reb": 0,   # trades du jour (UTC) : tendance / rebond
+    "credit_day": None, "credits": 0,
+    "armed": None,                 # contexte du cycle précédent (touche ratée)
+}
+_cache = {"m30": (None, 0), "m15": (None, None)}
+
+# ══════════════════════════════════════════════════════════════
+#  Horloge / session
+# ══════════════════════════════════════════════════════════════
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def in_session():
+    n = now_utc()
+    return n.weekday() < 5 and SESSION_START_UTC <= n.hour < SESSION_END_UTC
 
 def in_news_blackout():
-    now_ny = datetime.now(NY_TZ)
-    t = now_ny.time()
-    for start, end in NEWS_BLACKOUTS:
-        if start <= t < end:
-            return True
-    if now_ny.strftime("%Y-%m-%d") in FOMC_DATES:
-        if FOMC_BLACKOUT[0] <= t < FOMC_BLACKOUT[1]:
-            return True
-    return False
-
-async def get_candles(symbol, interval="5min", outputsize=200):
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.get(
-                "https://api.twelvedata.com/time_series",
-                params={"symbol": symbol, "interval": interval,
-                        "outputsize": outputsize, "apikey": TWELVE_API_KEY, "format": "JSON"}
-            )
-            data = r.json()
-        if "values" not in data:
-            log.error("Twelve Data %s: %s", symbol, data.get("message", data))
-            return None
-        df = pd.DataFrame(data["values"]).rename(columns={"datetime": "time"})
-        for col in ["open", "high", "low", "close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.iloc[::-1].reset_index(drop=True)
-        df = df.dropna(subset=["open", "high", "low", "close"])
-        return df if len(df) >= 20 else None
-    except Exception as e:
-        log.error("get_candles %s: %s", symbol, e)
-        return None
-
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def wilder_smooth(series, period):
-    return series.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
-def atr(df, period=14):
-    hi, lo, cl = df["high"], df["low"], df["close"]
-    tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
-    return wilder_smooth(tr, period)
-
-def adx(df, period=14):
-    up, down = df["high"].diff(), -df["low"].diff()
-    pdm = pd.Series(0.0, index=df.index)
-    mdm = pd.Series(0.0, index=df.index)
-    pdm[(up > down) & (up > 0)]   = up
-    mdm[(down > up) & (down > 0)] = down
-    atr_v = atr(df, period)
-    pdi = 100 * wilder_smooth(pdm, period) / atr_v.replace(0, pd.NA)
-    mdi = 100 * wilder_smooth(mdm, period) / atr_v.replace(0, pd.NA)
-    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, pd.NA)
-    return wilder_smooth(dx, period), pdi, mdi
-
-def rsi(series, period=14):
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    rs    = wilder_smooth(gain, period) / wilder_smooth(loss, period).replace(0, pd.NA)
-    return (100 - (100 / (1 + rs))).fillna(100)
-
-def closed_df(df):
-    if df is None or len(df) < 5: return df
-    return df.iloc[:-1].copy()
-
-def get_structure(df, lookback=20):
-    # FIX v23.2 : on compare le close actuel aux bougies PRÉCÉDENTES uniquement.
-    # Avant, la bougie actuelle était incluse → close > sa propre high impossible.
-    if len(df) < lookback + 5: return None
-    prev    = df.iloc[-(lookback+1):-1]
-    current = float(df["close"].iloc[-1])
-    if current > float(prev["high"].max()): return "BOS_BULL"
-    if current < float(prev["low"].min()):  return "BOS_BEAR"
-    return "RANGE"
-
-def double_impulse(df, atr_value):
-    if len(df) < 5: return False, False
-    c1, c2 = df.iloc[-1], df.iloc[-2]
-    b1 = abs(c1["close"] - c1["open"])
-    b2 = abs(c2["close"] - c2["open"])
-    bull = c1["close"] > c1["open"] and c2["close"] > c2["open"] and b1 > atr_value*0.3 and b2 > atr_value*0.3
-    bear = c1["close"] < c1["open"] and c2["close"] < c2["open"] and b1 > atr_value*0.3 and b2 > atr_value*0.3
-    return bull, bear
-
-def detect_breakout(df, atr_value, lookback=20):
-    if len(df) < lookback + 3: return None
-    current  = df.iloc[-1]
-    previous = df.iloc[-(lookback+1):-1]
-    body     = abs(current["close"] - current["open"])
-    if current["close"] > float(previous["high"].max()) and body > atr_value*0.8: return "BULL"
-    if current["close"] < float(previous["low"].min())  and body > atr_value*0.8: return "BEAR"
-    return None
-
-def detect_pattern(df):
-    if len(df) < 4: return None
-    cur, prev = df.iloc[-1], df.iloc[-2]
-    o, h, l, c = float(cur["open"]), float(cur["high"]), float(cur["low"]), float(cur["close"])
-    po, pc = float(prev["open"]), float(prev["close"])
-    total = h - l
-    if total <= 0: return None
-    body  = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    if body/total < 0.10:                                         return "DOJI"
-    if lower/total > 0.55 and body/total < 0.35 and c >= o:      return "PIN_BULL"
-    if upper/total > 0.55 and body/total < 0.35 and c <= o:      return "PIN_BEAR"
-    if c > o and pc < po and c >= po and o <= pc:                 return "ENGULFING_BULL"
-    if c < o and pc > po and c <= po and o >= pc:                 return "ENGULFING_BEAR"
-    return None
-
-def detect_fvg(df, atr_value=None, lookback=30, min_atr_ratio=0.15):
-    if len(df) < 5: return None
-    start = max(2, len(df) - lookback)
-    best  = None
-    for i in range(start, len(df)):
-        c1, c3 = df.iloc[i-2], df.iloc[i]
-        gl, gh = float(c1["high"]), float(c3["low"])
-        if gh > gl and (atr_value is None or gh-gl >= atr_value*min_atr_ratio):
-            best = ("BULL", round(gl,2), round(gh,2), i)
-        gl, gh = float(c3["high"]), float(c1["low"])
-        if gh > gl and (atr_value is None or gh-gl >= atr_value*min_atr_ratio):
-            best = ("BEAR", round(gl,2), round(gh,2), i)
-    if best is None: return None
-    direction, low, high, index = best
-    future = df.iloc[index+1:]
-    if len(future) > 0:
-        if direction == "BULL" and future["low"].min() <= low:  return None
-        if direction == "BEAR" and future["high"].max() >= high: return None
-    return (direction, low, high)
-
-def detect_ob(df, atr_value, lookback=40, impulse_mult=1.2):
-    if len(df) < 10: return None
-    candidates = []
-    for i in range(max(2, len(df)-lookback), len(df)-3):
-        c = df.iloc[i]
-        o, cl, h, l = float(c["open"]), float(c["close"]), float(c["high"]), float(c["low"])
-        future = df.iloc[i+1:i+4]
-        if len(future) < 2: continue
-        if cl < o and (float(future["high"].max()) - h) >= atr_value*impulse_mult:
-            candidates.append(("BULL", round(l,2), round(h,2), i))
-        if cl > o and (l - float(future["low"].min())) >= atr_value*impulse_mult:
-            candidates.append(("BEAR", round(l,2), round(h,2), i))
-    if not candidates: return None
-    direction, low, high, index = candidates[-1]
-    future = df.iloc[index+1:]
-    if direction == "BULL" and future["low"].min() <= low:  return None
-    if direction == "BEAR" and future["high"].max() >= high: return None
-    return (direction, low, high)
-
-def fibo_range(df, lookback=60):
-    r = df.tail(lookback)
-    return float(r["high"].max()), float(r["low"].min())
-
-def fibonacci_levels(high, low, direction):
-    # FIX v23.2 : BUY = retracement depuis le haut, SELL = retracement depuis le bas.
-    d = high - low
-    if d <= 0: return None
-    r = {"38.2": .382, "50.0": .5, "61.8": .618}
-    if direction == "BUY":
-        return {k: round(high - d*v, 2) for k, v in r.items()}
-    return {k: round(low + d*v, 2) for k, v in r.items()}
-
-def check_zone_rejection(df5, entry, direction):
-    n = len(df5)
-    lookback = min(REJECT_LOOKBACK, n-1)
-    for i in range(n-2, n-2-lookback, -1):
-        if i < 0: break
-        o = float(df5["open"].iloc[i]); c = float(df5["close"].iloc[i])
-        h = float(df5["high"].iloc[i]); l = float(df5["low"].iloc[i])
-        if direction == "SELL" and c < o and h >= entry - REJECT_RANGE: return True
-        if direction == "BUY"  and c > o and l <= entry + REJECT_RANGE: return True
-    return False
-
-async def get_htf_analysis(symbol):
-    # FIX v23.2 : 500 bougies pour une EMA 200 fiable (1 crédit API quel que soit outputsize)
-    df = await get_candles(symbol, interval="30min", outputsize=500)
-    if df is None: return None
-    df = closed_df(df)
-    if len(df) < 210: return None
-    df["ema20"]  = ema(df["close"], 20)
-    df["ema50"]  = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    p = float(df["close"].iloc[-1])
-    e20, e50, e200 = float(df["ema20"].iloc[-1]), float(df["ema50"].iloc[-1]), float(df["ema200"].iloc[-1])
-    if p > e20 > e50 > e200: return "BULL_STRONG"
-    if p < e20 < e50 < e200: return "BEAR_STRONG"
-    if e20 > e50: return "BULL"
-    if e20 < e50: return "BEAR"
-    return "NEUTRAL"
-
-async def get_m5_confirmation(symbol, direction):
-    df = await get_candles(symbol, interval="5min", outputsize=120)
-    if df is None: return None
-    df = closed_df(df)
-    if len(df) < 60: return None
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    atr_v       = float(atr(df).iloc[-1])
-    adx_v, pdi, mdi = adx(df)
-    pattern = detect_pattern(df)
-    score   = 0
-    if direction == "BUY":
-        if df["ema20"].iloc[-1] > df["ema50"].iloc[-1]: score += 25
-        if pattern in ("ENGULFING_BULL", "PIN_BULL"):    score += 20
-        if pdi.iloc[-1] > mdi.iloc[-1]:                  score += 20
-    else:
-        if df["ema20"].iloc[-1] < df["ema50"].iloc[-1]: score += 25
-        if pattern in ("ENGULFING_BEAR", "PIN_BEAR"):    score += 20
-        if mdi.iloc[-1] > pdi.iloc[-1]:                  score += 20
-    if adx_v.iloc[-1] >= 20: score += 15
-    return {"price": round(float(df["close"].iloc[-1]),2), "score": score,
-            "pattern": pattern, "atr": atr_v, "df5": df}
-
-def calculate_confidence(direction, htf, ef, es, price,
-                          pdi, mdi, adx_value, rsi_value,
-                          pattern, fvg, ob, structure, breakout):
-    score, reasons = 0, []
-    if direction == "BUY":
-        if htf == "BULL_STRONG": score += 20; reasons.append("M30 tendance forte")
-        elif htf == "BULL":      score += 12; reasons.append("M30 haussier")
-        if ef > es:              score += 15; reasons.append("EMA M15 bullish")
-        if pdi > mdi:            score += 15; reasons.append("+DI dominant")
-        if 50 <= rsi_value <= 68: score += 8; reasons.append("RSI bullish sain")
-        if pattern in ("ENGULFING_BULL", "PIN_BULL"): score += 7
-        if structure == "BOS_BULL": score += 10; reasons.append("Break structure bullish")
-        if fvg and fvg[0] == "BULL": score += 7;  reasons.append("FVG aligné")
-        if ob  and ob[0]  == "BULL": score += 10; reasons.append("OB aligné")
-    else:
-        if htf == "BEAR_STRONG": score += 20; reasons.append("M30 tendance forte")
-        elif htf == "BEAR":      score += 12; reasons.append("M30 baissier")
-        if ef < es:              score += 15; reasons.append("EMA M15 bearish")
-        if mdi > pdi:            score += 15; reasons.append("-DI dominant")
-        if 32 <= rsi_value <= 50: score += 8; reasons.append("RSI bearish sain")
-        if pattern in ("ENGULFING_BEAR", "PIN_BEAR"): score += 7
-        if structure == "BOS_BEAR": score += 10; reasons.append("Break structure bearish")
-        if fvg and fvg[0] == "BEAR": score += 7;  reasons.append("FVG aligné")
-        if ob  and ob[0]  == "BEAR": score += 10; reasons.append("OB aligné")
-    if adx_value >= 30:   score += 15; reasons.append("ADX fort")
-    elif adx_value >= 23: score += 8;  reasons.append("ADX valide")
-    if breakout: score += 10; reasons.append("Breakout confirmé")
-    return min(score, 100), reasons
-
-async def analyze_xauusd():
-    cfg = XAUUSD_CONFIG
-    htf, df = await asyncio.gather(
-        get_htf_cached(cfg["symbol"]),
-        get_candles(cfg["symbol"], interval="15min", outputsize=200),
-    )
-    if not htf or df is None: return None
-    df = closed_df(df)
-    if len(df) < 100: return None
-
-    df["ef"] = ema(df["close"], cfg["ema_fast"])
-    df["es"] = ema(df["close"], cfg["ema_slow"])
-    atr_v    = float(atr(df, cfg["atr_period"]).iloc[-1])
-    adx_s, pdi, mdi = adx(df, cfg["adx_period"])
-    adx_v = float(adx_s.iloc[-1]); pdi_v = float(pdi.iloc[-1]); mdi_v = float(mdi.iloc[-1])
-    rsi_v = float(rsi(df["close"], cfg["rsi_period"]).iloc[-1])
-    price = float(df["close"].iloc[-1])
-    ef    = float(df["ef"].iloc[-1]); es = float(df["es"].iloc[-1])
-
-    structure        = get_structure(df, cfg["swing_lookback"])
-    breakout         = detect_breakout(df, atr_v, cfg["swing_lookback"])
-    bull_imp, bear_imp = double_impulse(df, atr_v)
-    pattern          = detect_pattern(df)
-    fvg              = detect_fvg(df, atr_v, min_atr_ratio=cfg["fvg_min_atr"])
-    ob               = detect_ob(df, atr_v, impulse_mult=cfg["ob_impulse_atr"])
-    swing_h, swing_l = fibo_range(df, cfg["fibo_lookback"])
-
-    # ── Filtre RSI dur : extensions extrêmes ──────────────────
-    if rsi_v < 28:
-        log.info("Signal bloqué : RSI extrême bas %.1f (oversold)", rsi_v)
-        return None
-    if rsi_v > 72:
-        log.info("Signal bloqué : RSI extrême haut %.1f (overbought)", rsi_v)
-        return None
-
-    buy_ok  = (htf in ("BULL","BULL_STRONG") and ef > es and pdi_v > mdi_v
-               and adx_v >= cfg["adx_min"]
-               and (bull_imp or breakout == "BULL" or structure == "BOS_BULL"))
-    sell_ok = (htf in ("BEAR","BEAR_STRONG") and ef < es and mdi_v > pdi_v
-               and adx_v >= cfg["adx_min"]
-               and (bear_imp or breakout == "BEAR" or structure == "BOS_BEAR"))
-
-    direction = "BUY" if buy_ok else ("SELL" if sell_ok else None)
-    if direction is None:
-        log.info("Pas de setup (htf=%s ef>es=%s +DI>-DI=%s adx=%.1f struct=%s brk=%s)",
-                 htf, ef > es, pdi_v > mdi_v, adx_v, structure, breakout)
-        return None
-
-    # FIX v23.2 : Fibo calculé selon la direction
-    fib = fibonacci_levels(swing_h, swing_l, direction)
-
-    confidence, reasons = calculate_confidence(
-        direction, htf, ef, es, price, pdi_v, mdi_v, adx_v, rsi_v,
-        pattern, fvg, ob, structure, breakout)
-
-    if confidence < MIN_CONFIDENCE:
-        log.info("Signal %s rejeté : confidence %s < %s", direction, confidence, MIN_CONFIDENCE)
-        return None
-
-    m5 = await get_m5_confirmation(cfg["symbol"], direction)
-    if m5 is None or m5["score"] < M5_MIN_SCORE:
-        log.info("Signal %s rejeté : M5 faible (%s)", direction, m5["score"] if m5 else None)
-        return None
-
-    stop_distance = atr_v * 1.5
-    sl   = price - stop_distance if direction == "BUY" else price + stop_distance
-    risk = abs(price - sl)
-    if direction == "BUY":
-        tp1, tp2, tp3 = price+risk, price+risk*1.5, price+risk*2.5
-    else:
-        tp1, tp2, tp3 = price-risk, price-risk*1.5, price-risk*2.5
-
-    return {
-        "direction": direction, "price": round(price,2), "sl": round(sl,2),
-        "tp1": round(tp1,2), "tp2": round(tp2,2), "tp3": round(tp3,2),
-        "adx": round(adx_v,1), "pdi": round(pdi_v,1), "mdi": round(mdi_v,1),
-        "rsi": round(rsi_v,1), "htf": htf, "pattern": pattern,
-        "structure": structure, "breakout": breakout, "fvg": fvg, "ob": ob,
-        "fib": fib, "swing_h": swing_h, "swing_l": swing_l,
-        "atr": atr_v, "confidence": confidence, "reasons": reasons,
-        "m5_score": m5["score"], "m5_pattern": m5["pattern"], "m5_df5": m5["df5"],
-        "signal_type": "BREAKOUT_CONF" if breakout else "SIGNAL",
-    }
-
-def calc_limit_entry(signal):
-    direction = signal["direction"]; atr_v = signal["atr"]
-    fib = signal["fib"]; fvg = signal["fvg"]; ob = signal["ob"]; price = signal["price"]
-    candidates = []
-    if fib:
-        for lvl_name in ["38.2","50.0","61.8"]:
-            lvl = fib[lvl_name]
-            if direction == "BUY"  and lvl >= price: continue
-            if direction == "SELL" and lvl <= price: continue
-            score = {"38.2":15,"50.0":20,"61.8":25}[lvl_name]; conf = []
-            if fvg:
-                if direction == "BUY"  and fvg[0]=="BULL" and fvg[1]-8<=lvl<=fvg[2]+8: score+=25; conf.append("FVG")
-                if direction == "SELL" and fvg[0]=="BEAR" and fvg[1]-8<=lvl<=fvg[2]+8: score+=25; conf.append("FVG")
-            if ob:
-                if direction == "BUY"  and ob[0]=="BULL" and ob[1]-8<=lvl<=ob[2]+8: score+=30; conf.append("OB")
-                if direction == "SELL" and ob[0]=="BEAR" and ob[1]-8<=lvl<=ob[2]+8: score+=30; conf.append("OB")
-            sl = lvl-atr_v*0.8 if direction=="BUY" else lvl+atr_v*0.8
-            candidates.append({"limit":round(lvl,2),"sl":round(sl,2),"source":"FIBO "+lvl_name,"score":score,"confluence":conf})
-    if ob:
-        if direction=="BUY"  and ob[0]=="BULL": candidates.append({"limit":ob[2],"sl":ob[1]-atr_v*0.4,"source":"ORDER BLOCK","score":65,"confluence":["OB"]})
-        if direction=="SELL" and ob[0]=="BEAR": candidates.append({"limit":ob[1],"sl":ob[2]+atr_v*0.4,"source":"ORDER BLOCK","score":65,"confluence":["OB"]})
-    if fvg:
-        if direction=="BUY"  and fvg[0]=="BULL": candidates.append({"limit":fvg[2]+ENTRY_BUFFER,"sl":fvg[1]-atr_v*0.4,"source":"FVG","score":60,"confluence":["FVG"]})
-        if direction=="SELL" and fvg[0]=="BEAR": candidates.append({"limit":fvg[1]-ENTRY_BUFFER,"sl":fvg[2]+atr_v*0.4,"source":"FVG","score":60,"confluence":["FVG"]})
-    if not candidates: return None
-    best  = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
-    entry = best["limit"]; sl = best["sl"]; risk = abs(entry-sl)
-    if risk <= 0: return None
-
-    # FIX v23.2 : R:R mesuré sur une vraie cible structurelle (swing high / swing low)
-    target = signal["swing_h"] if direction == "BUY" else signal["swing_l"]
-    reward = (target - entry) if direction == "BUY" else (entry - target)
-    rr = reward / risk
-    if rr < XAUUSD_CONFIG["min_rr"]:
-        log.info("Limit %s @ %s rejeté : R:R %.2f vers cible %.2f", direction, entry, rr, target)
-        return None
-    best["rr"] = round(rr,2); best["target"] = round(target,2)
-    best["confidence"] = "HIGH" if best["score"]>=70 else "MEDIUM"
-    return best
-
-
-# ══════════════════════════════════════════════════════════════
-#  v23.3 — cache M30, prix live, mode SNIPER
-# ══════════════════════════════════════════════════════════════
-
-_htf_cache = {"value": None, "ts": 0}
-
-async def get_htf_cached(symbol):
-    if _htf_cache["value"] and time.time() - _htf_cache["ts"] < HTF_CACHE_SEC:
-        return _htf_cache["value"]
-    value = await get_htf_analysis(symbol)
-    if value:
-        _htf_cache["value"], _htf_cache["ts"] = value, time.time()
-    return value
-
-async def get_live_price(symbol):
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.get("https://api.twelvedata.com/price",
-                                 params={"symbol": symbol, "apikey": TWELVE_API_KEY})
-            return float(r.json()["price"])
-    except Exception as e:
-        log.error("get_live_price %s: %s", symbol, e)
-        return None
+    now_ny = datetime.now(NY_TZ); t = now_ny.time()
+    if any(s <= t < e for s, e in NEWS_BLACKOUTS): return True
+    return now_ny.strftime("%Y-%m-%d") in FOMC_DATES and FOMC_BLACKOUT[0] <= t < FOMC_BLACKOUT[1]
 
 def seconds_to_next_m5():
     now = time.time()
-    nxt = (int(now) // 300 + 1) * 300 + SCAN_OFFSET_SEC
-    return max(5, nxt - now)
+    return max(5, (int(now) // 300 + 1) * 300 + SCAN_OFFSET_SEC - now)
 
-def sniper_trigger(signal, df5):
-    """Cherche le pullback + rejet sur la dernière bougie M5 fermée.
-    Retourne ("ENTRY", sl) / ("INVALID", raison) / ("MISSED", raison) / (None, None)."""
-    d     = signal["direction"]
-    sens  = 1 if d == "BUY" else -1
-    risk0 = abs(signal["price"] - signal["sl"])
-    df5   = df5.copy()
-    df5["ema20"] = ema(df5["close"], 20)
-    atr5  = float(atr(df5).iloc[-1])
-    last  = df5.iloc[-1]
-    recent = df5.iloc[-3:]
-    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
-    e20 = float(last["ema20"])
+def reset_daily():
+    d = now_utc().date()
+    if state["day"] != d: state["day"], state["count"], state["count_reb"] = d, 0, 0
+    if state["credit_day"] != d: state["credit_day"], state["credits"] = d, 0
 
-    # 1) Invalidation : le prix a franchi le SL du setup
-    if (d == "SELL" and h >= signal["sl"]) or (d == "BUY" and l <= signal["sl"]):
-        return "INVALID", "SL du setup touché avant l'entrée"
-    # 2) Raté : TP1 déjà atteint sans pullback
-    if (d == "SELL" and l <= signal["tp1"]) or (d == "BUY" and h >= signal["tp1"]):
-        return "MISSED", "TP1 atteint sans pullback — ne cours pas après le prix"
+# ══════════════════════════════════════════════════════════════
+#  Données Twelve Data
+# ══════════════════════════════════════════════════════════════
+async def get_candles(interval="5min", outputsize=200):
+    state["credits"] += 1
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get("https://api.twelvedata.com/time_series",
+                                 params={"symbol": SYMBOL, "interval": interval, "outputsize": outputsize,
+                                         "apikey": TWELVE_API_KEY, "format": "JSON"})
+            data = r.json()
+        if "values" not in data:
+            log.error("Twelve Data %s: %s", interval, data.get("message", data)); return None
+        df = pd.DataFrame(data["values"]).rename(columns={"datetime": "time"})
+        for c in ("open", "high", "low", "close"): df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.iloc[::-1].reset_index(drop=True).dropna(subset=["open", "high", "low", "close"])
+        df["time"] = pd.to_datetime(df["time"])
+        return df if len(df) >= 20 else None
+    except Exception as e:
+        log.error("get_candles %s: %s", interval, e); return None
 
-    # 3) Pullback : une des 3 dernières bougies est revenue vers l'EMA20 M5
-    if d == "SELL":
-        pullback = float(recent["high"].max()) >= float(recent["ema20"].min()) - PULLBACK_ATR * atr5
-    else:
-        pullback = float(recent["low"].min()) <= float(recent["ema20"].max()) + PULLBACK_ATR * atr5
-    # 4) Rejet : bougie fermée dans le sens du trade, sous/au-dessus de l'EMA20
-    pattern = detect_pattern(df5)
-    if d == "SELL":
-        rejection = (c < o and c < e20) or pattern in ("PIN_BEAR", "ENGULFING_BEAR")
-    else:
-        rejection = (c > o and c > e20) or pattern in ("PIN_BULL", "ENGULFING_BULL")
-    # 5) Pas trop tard : le prix n'a pas déjà fait la moitié du chemin vers TP1
-    travelled = (signal["price"] - c) * (1 if d == "SELL" else -1)
-    too_late = travelled >= risk0 * TOO_LATE_R
+async def get_live_price():
+    state["credits"] += 1
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get("https://api.twelvedata.com/price", params={"symbol": SYMBOL, "apikey": TWELVE_API_KEY})
+            return float(r.json()["price"])
+    except Exception as e:
+        log.error("get_live_price: %s", e); return None
 
-    if not (pullback and rejection) or too_late:
-        return None, None
+def closed(df):
+    return None if df is None or len(df) < 5 else df.iloc[:-1].copy()   # dernière bougie = en formation
 
-    # SL chirurgical : derrière le pullback, borné entre SL_MIN_ATR et le SL du setup
-    atr15 = signal["atr"]
-    if d == "SELL":
-        sl = float(recent["high"].max()) + SL_BUFFER_ATR * atr15
-        sl = max(sl, c + SL_MIN_ATR * atr15)
-        sl = min(sl, signal["sl"])
-    else:
-        sl = float(recent["low"].min()) - SL_BUFFER_ATR * atr15
-        sl = min(sl, c - SL_MIN_ATR * atr15)
-        sl = max(sl, signal["sl"])
-    return "ENTRY", round(sl, 2)
+# ══════════════════════════════════════════════════════════════
+#  Indicateurs (Wilder)
+# ══════════════════════════════════════════════════════════════
+def ema(s, p): return s.ewm(span=p, adjust=False).mean()
+def wilder(s, p): return s.ewm(alpha=1/p, adjust=False, min_periods=p).mean()
 
-def format_setup_message(signal):
-    d = signal["direction"]
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    return (
-        f"🟡 SETUP {d} — XAUUSD\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {now}\n"
-        f"📍 Prix setup : {signal['price']}\n"
-        f"🛑 Invalidation : {signal['sl']}\n"
-        f"🎯 Objectifs : {signal['tp1']} / {signal['tp2']} / {signal['tp3']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧭 M30 : {signal['htf']} | 🔬 M5 : {signal['m5_score']}/80\n"
-        f"🟢 CONFIANCE : {signal['confidence']}/100\n"
-        f"✅ " + " | ".join(signal["reasons"]) + "\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ NE RENTRE PAS ENCORE — j'attends un pullback M5\n"
-        f"et je t'envoie « 🎯 ENTRE MAINTENANT » (max {ENTRY_WINDOW_M5*5} min)"
-    )
+def atr(df, p=14):
+    hi, lo, cl = df["high"], df["low"], df["close"]
+    tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    return wilder(tr, p)
 
-def format_entry_message(signal, entry, sl, live=None):
-    d = signal["direction"]
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    px = live if live else entry
-    risk = abs(px - sl)
-    def rr(tp): return round(abs(tp - px) / risk, 2) if risk > 0 else 0
-    msg = (
-        f"🎯 ENTRE MAINTENANT — {('🟢 BUY' if d=='BUY' else '🔴 SELL')} XAUUSD\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {now}\n"
-        f"⚡ Prix : {round(px,2)}" + (" (live)" if live else " (clôture M5)") + "\n"
-        f"🛑 SL   : {sl}  ({round(risk,2)} $)\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 TP1  : {signal['tp1']} (R:R {rr(signal['tp1'])}) → sécurise 50 % + SL à l'entrée\n"
-        f"🎯 TP2  : {signal['tp2']} (R:R {rr(signal['tp2'])})\n"
-        f"🎯 TP3  : {signal['tp3']} (R:R {rr(signal['tp3'])})\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🕯 Pullback M5 vers EMA20 + bougie de rejet confirmée"
-    )
-    if live:
-        sens = 1 if d == "BUY" else -1
-        if (live - entry) * sens >= abs(entry - sl) * TOO_LATE_R:
-            msg += "\n⚠️ Le prix a déjà bougé depuis la clôture M5 — vérifie avant d'entrer"
-    return msg
+def adx(df, p=14):
+    up, down = df["high"].diff(), -df["low"].diff()
+    pdm = pd.Series(0.0, index=df.index); mdm = pd.Series(0.0, index=df.index)
+    pdm[(up > down) & (up > 0)] = up; mdm[(down > up) & (down > 0)] = down
+    a = atr(df, p)
+    pdi = 100 * wilder(pdm, p) / a.replace(0, pd.NA); mdi = 100 * wilder(mdm, p) / a.replace(0, pd.NA)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, pd.NA)
+    return wilder(dx, p), pdi, mdi
 
-def format_direct_message(signal, live=None):
-    d    = signal["direction"]
-    icon = "🟢" if signal["confidence"] >= 85 else "🟡"
-    now  = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    risk = abs(signal["price"] - signal["sl"])
-    sens = 1 if d == "BUY" else -1
-    entry = live if live else signal["price"]
-    sl, tp1 = entry - sens*risk, entry + sens*risk
-    tp2, tp3 = entry + sens*risk*1.5, entry + sens*risk*2.5
-    msg = (f"{'🟢' if d=='BUY' else '🔴'} SIGNAL {d} — XAUUSD\n━━━━━━━━━━━━━━━━━━\n🕐 {now}\n")
-    if live:
-        moved = (live - signal["price"]) * sens
-        msg += (f"📍 Prix signal : {signal['price']}\n"
-                f"⚡ Prix ACTUEL : {round(live,2)} ({'+' if moved>=0 else ''}{round(moved,2)} $)\n")
-        if moved >= risk * TOO_LATE_R:
-            msg += "⚠️ TROP TARD — le prix est déjà parti, ne rentre pas\n"
-    else:
-        msg += f"📍 Entry : {signal['price']} (prix live indisponible)\n"
-    msg += (
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🛑 SL    : {round(sl,2)}  ({round(risk,2)} $)\n"
-        f"🎯 TP1   : {round(tp1,2)} (1R) → sécurise 50 % + SL à l'entrée\n"
-        f"🎯 TP2   : {round(tp2,2)} (1.5R)\n"
-        f"🎯 TP3   : {round(tp3,2)} (2.5R)\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 ADX {signal['adx']} | +DI {signal['pdi']} | -DI {signal['mdi']} | RSI {signal['rsi']}\n"
-        f"🧭 M30 : {signal['htf']} | 🏗 {signal['structure']} | 🔬 M5 {signal['m5_score']}/80\n"
-        f"━━━━━━━━━━━━━━━━━━\n{icon} CONFIANCE : {signal['confidence']}/100\n"
-    )
-    if signal["reasons"]: msg += "✅ " + " | ".join(signal["reasons"])
-    return msg
+def rsi(s, p=14):
+    d = s.diff(); g = d.clip(lower=0); l = -d.clip(upper=0)
+    rs = wilder(g, p) / wilder(l, p).replace(0, pd.NA)
+    return (100 - 100 / (1 + rs)).fillna(100)
 
-def format_limit_message(signal, limit, sell_rejected=False):
-    if limit is None: return None
-    d = signal["direction"]; entry = limit["limit"]; sl = limit["sl"]; risk = abs(entry-sl)
-    tp1 = entry+risk if d=="BUY" else entry-risk
-    tp2 = entry+risk*1.5 if d=="BUY" else entry-risk*1.5
-    tp3 = entry+risk*2.5 if d=="BUY" else entry-risk*2.5
-    msg = (
-        f"📌 ORDRE LIMIT — XAUUSD\n━━━━━━━━━━━━━━━━━━\n"
-        f"{'🟢' if d=='BUY' else '🔴'} {d} LIMIT\n\n"
-        f"📍 ENTRY : {entry}\n🛑 SL    : {round(sl,2)}\n━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 TP1   : {round(tp1,2)}\n🎯 TP2   : {round(tp2,2)}\n🎯 TP3   : {round(tp3,2)}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📐 Source : {limit['source']}\n"
-        f"🔥 Confluence : {', '.join(limit['confluence']) or 'FIBO'}\n"
-        f"📊 Score zone : {limit['score']}/100\n"
-        f"⚖️ RR vers {'swing high' if d=='BUY' else 'swing low'} ({limit['target']}) : {limit['rr']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-    )
-    if d == "SELL":
-        msg += "🕯 Rejet M5 : ✅ confirmé\n" if sell_rejected else "🕯 Rejet M5 : ⏳ en attente — attends une bougie M5 baissière dans la zone\n"
-    msg += "⏳ Invalidation : annuler après 12 bougies M15"
-    return msg
+# ══════════════════════════════════════════════════════════════
+#  Logique de la stratégie (fonctions pures → testables)
+# ══════════════════════════════════════════════════════════════
+def htf_state(df30):
+    """M30 fermé : 2 = haussier fort, 1 = haussier, -1 = baissier, -2 = baissier fort, 0 = neutre."""
+    if df30 is None or len(df30) < 210: return None
+    c = df30["close"]; e20, e50, e200 = ema(c, 20).iloc[-1], ema(c, 50).iloc[-1], ema(c, 200).iloc[-1]
+    p = c.iloc[-1]
+    if p > e20 > e50 > e200: return 2
+    if p < e20 < e50 < e200: return -2
+    return 1 if e20 > e50 else (-1 if e20 < e50 else 0)
 
-last_signal = {"XAUUSD": {"direction": None, "price": None, "ts": 0}}
-pending = {"signal": None, "candles_left": 0}
+def m15_state(df15):
+    if df15 is None or len(df15) < 60: return None
+    c = df15["close"]; a, p, m = adx(df15, 14)
+    return {"ef": float(ema(c, 20).iloc[-1]), "es": float(ema(c, 50).iloc[-1]), "atr": float(atr(df15, 14).iloc[-1]),
+            "adx": float(a.iloc[-1]), "pdi": float(p.iloc[-1]), "mdi": float(m.iloc[-1]), "rsi": float(rsi(c, 14).iloc[-1])}
 
-def should_send_signal(signal):
-    prev    = last_signal["XAUUSD"]
-    elapsed = time.time() - prev["ts"]
-    if prev["direction"] != signal["direction"]: return True
-    if elapsed >= SIGNAL_COOLDOWN:               return True
-    if prev["price"] and abs(signal["price"]-prev["price"]) >= signal["atr"]*1.5: return True
-    return False
+def trend_direction(htf, m15):
+    """-1 = on cherche des SELL, 1 = des BUY, 0 = rien."""
+    if htf is None or m15 is None or pd.isna(m15["adx"]): return 0
+    if not (RSI_MIN <= m15["rsi"] <= RSI_MAX) or m15["adx"] < ADX_MIN: return 0
+    if htf <= -1 and m15["ef"] < m15["es"] and m15["mdi"] > m15["pdi"]: return -1
+    if htf >= 1 and m15["ef"] > m15["es"] and m15["pdi"] > m15["mdi"]: return 1
+    return 0
 
+def m5_context(df5, s):
+    """df5 = bougies M5 FERMÉES. Retourne l'EMA à toucher pour la bougie suivante et si le pullback est valide."""
+    c = df5["close"]; e = ema(c, EMA_M5)
+    e_prev_bar = e.shift(1)                    # EMA connue à l'ouverture de chaque bougie
+    away_ok = s != 0 and all((c.iloc[-k] - e_prev_bar.iloc[-k]) * s > 0 for k in range(1, AWAY_BARS + 1))
+    return {"ema_next": float(e.iloc[-1]), "away_ok": away_ok, "last_close": float(c.iloc[-1]),
+            "last_high": float(df5["high"].iloc[-1]), "last_low": float(df5["low"].iloc[-1]),
+            "last_ema": float(e_prev_bar.iloc[-1]), "last_time": df5["time"].iloc[-1]}
+
+def touch_entry(s, ema_level, live):
+    """Le prix live touche l'EMA dans le sens du pullback → prix d'entrée, sinon None."""
+    if live is None: return None
+    return live if ((s < 0 and live >= ema_level) or (s > 0 and live <= ema_level)) else None
+
+def build_trade(s, entry, atr15, extra=None, sl_dist=None, tp_dist=None):
+    """Tendance : SL 0.8 ATR M15, TP 1.5 R. Rebond : distances données (3 ATR M5 / 1.5 ATR M5)."""
+    risk = sl_dist if sl_dist is not None else SL_ATR * atr15
+    tpd = tp_dist if tp_dist is not None else TP_R * risk
+    t = {"dir": "SELL" if s < 0 else "BUY", "s": s, "entry": round(entry, 2),
+         "sl": round(entry - s * risk, 2), "tp": round(entry + s * tpd, 2),
+         "risk": round(risk, 2), "tp_r": round(tpd / risk, 2), "opened": now_utc(), "strat": "TENDANCE"}
+    t.update(extra or {})
+    return t
+
+def rebond_signal(df5, trend15):
+    """df5 = bougies M5 FERMÉES. Mèche ≥ 60 % qui rejette l'EMA20 M5 dans le sens de la tendance M15.
+    Retourne (s, atr5) : s = 1 BUY, -1 SELL, 0 rien."""
+    if df5 is None or len(df5) < 40 or not trend15: return 0, None
+    e = float(ema(df5["close"], EMA_M5).iloc[-1]); a5 = float(atr(df5, 14).iloc[-1])
+    o, h, l, c = (float(df5[k].iloc[-1]) for k in ("open", "high", "low", "close"))
+    rng = max(h - l, 1e-9)
+    lw = (min(o, c) - l) / rng; uw = (h - max(o, c)) / rng
+    if trend15 > 0 and l <= e and c > e and lw >= REB_WICK: return 1, a5
+    if trend15 < 0 and h >= e and c < e and uw >= REB_WICK: return -1, a5
+    return 0, a5
+
+def check_exit(trade, bars):
+    """bars = bougies M5 fermées depuis l'entrée (la 1re contient l'entrée).
+    SL prioritaire si SL et TP dans la même bougie. Sur la bougie d'entrée on ne regarde que le SL
+    (le prix d'avant l'entrée ne compte pas pour le TP) — même règle que le backtest."""
+    s = trade["s"]; entry_bar = pd.Timestamp(trade["opened"]).tz_localize(None).floor("5min")
+    for _, b in bars.iterrows():
+        if (s < 0 and b["high"] >= trade["sl"]) or (s > 0 and b["low"] <= trade["sl"]): return "SL"
+        if b["time"] <= entry_bar and not trade.get("tp_first_bar"): continue
+        if (s < 0 and b["low"] <= trade["tp"]) or (s > 0 and b["high"] >= trade["tp"]): return "TP"
+    return None
+
+def lot_for(risk_usd):
+    if risk_usd <= 0: return 0.01
+    return max(0.01, int(RISK_EUR / (risk_usd * 100) * 100) / 100)
+
+# ══════════════════════════════════════════════════════════════
+#  Messages
+# ══════════════════════════════════════════════════════════════
+HTF_TXT = {2: "HAUSSIÈRE FORTE", 1: "HAUSSIÈRE", -1: "BAISSIÈRE", -2: "BAISSIÈRE FORTE", 0: "NEUTRE"}
+
+def format_entry(t):
+    icon = "🔴" if t["dir"] == "SELL" else "🟢"
+    if t.get("strat") == "REBOND":
+        return (f"🎯 ENTRE MAINTENANT — {icon} {t['dir']} XAUUSD  ☀️ REBOND\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {t['opened'].strftime('%H:%M')} UTC\n"
+                f"⚡ Prix : {t['entry']} (live)\n"
+                f"🛑 SL   : {t['sl']}  ({t['risk']} $)\n"
+                f"🎯 TP   : {t['tp']}  ({t['tp_r']} R) — petit TP, forte réussite\n"
+                f"📦 Lot  : {lot_for(t['risk'])}  (risque ≈ {int(RISK_EUR)} €)\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕯 Rejet de l'EMA20 M5 (mèche ≥ 60 %) dans la tendance M15\n"
+                f"   trade {state['count_reb']}/{REB_MAX_DAY} rebond du jour\n"
+                f"⚠️ Mets SL + TP tout de suite, puis ne touche plus à rien")
+    return (f"🎯 ENTRE MAINTENANT — {icon} {t['dir']} XAUUSD  🌙 TENDANCE\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {t['opened'].strftime('%H:%M')} UTC\n"
+            f"⚡ Prix : {t['entry']} (live)\n"
+            f"🛑 SL   : {t['sl']}  ({t['risk']} $)\n"
+            f"🎯 TP   : {t['tp']}  (1.5 R) — TP unique\n"
+            f"📦 Lot  : {lot_for(t['risk'])}  (risque ≈ {int(RISK_EUR)} €)\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Tendance M30 {HTF_TXT.get(t.get('htf'), '?')} | ADX M15 {t.get('adx', 0):.0f}\n"
+            f"🕯 Retour sur l'EMA20 M5 | trade {state['count']}/{MAX_TRADES_DAY} du jour\n"
+            f"⚠️ Mets SL + TP tout de suite, puis ne touche plus à rien")
+
+def format_result(t, why):
+    tp_r = t.get("tp_r", TP_R)
+    gain = round(tp_r * RISK_EUR) if why == "TP" else -round(RISK_EUR)
+    if why == "TP":
+        return f"✅ TP TOUCHÉ — {t['dir']} {t['entry']} → {t['tp']}\n+{tp_r} R (≈ +{gain} €) 📒 note-le dans ton journal"
+    if why == "SL":
+        return f"❌ SL TOUCHÉ — {t['dir']} {t['entry']} → {t['sl']}\n−1 R (≈ {gain} €) 📒 note-le dans ton journal — c'est le jeu, on continue"
+    return f"⌛ {t['dir']} {t['entry']} toujours ouvert — {why}"
+
+# ══════════════════════════════════════════════════════════════
+#  Cycle principal
+# ══════════════════════════════════════════════════════════════
 async def send(bot, text):
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception as e:
         log.error("Telegram: %s", e)
 
-async def manage_pending(bot):
-    """Appelé à chaque clôture M5 tant qu'un setup SNIPER attend son entrée."""
-    sig = pending["signal"]
-    df5 = await get_candles(XAUUSD_CONFIG["symbol"], interval="5min", outputsize=60)
-    df5 = closed_df(df5)
-    if df5 is None or len(df5) < 25:
-        return
-    status, info = sniper_trigger(sig, df5)
-    if status == "ENTRY":
-        live = await get_live_price(XAUUSD_CONFIG["symbol"])
-        entry = float(df5["close"].iloc[-1])
-        await send(bot, format_entry_message(sig, entry, info, live))
-        log.info("SNIPER %s : entrée envoyée (SL %s)", sig["direction"], info)
-        pending["signal"] = None
-        return
-    if status in ("INVALID", "MISSED"):
-        icon = "❌" if status == "INVALID" else "⏭"
-        await send(bot, f"{icon} SETUP {sig['direction']} ANNULÉ — {info}")
-        pending["signal"] = None
-        return
-    pending["candles_left"] -= 1
-    if pending["candles_left"] <= 0:
-        await send(bot, f"⌛ SETUP {sig['direction']} EXPIRÉ — pas de bon point d'entrée en {ENTRY_WINDOW_M5*5} min, on laisse passer")
-        pending["signal"] = None
+async def get_context():
+    """Tendance M30 (cache 15 min) + M15 (1 fois par bougie M15) + M5 fermées."""
+    htf, ts = _cache["m30"]
+    if htf is None or time.time() - ts > HTF_CACHE_SEC:
+        htf = htf_state(closed(await get_candles("30min", 500)))
+        _cache["m30"] = (htf, time.time())
+    slot = int(time.time() // 900)
+    m15, s15 = _cache["m15"]
+    if m15 is None or s15 != slot:
+        m15 = m15_state(closed(await get_candles("15min", 200)))
+        _cache["m15"] = (m15, slot)
+    df5 = closed(await get_candles("5min", 80))
+    if df5 is None or m15 is None or htf is None: return None
+    s = trend_direction(htf, m15)
+    ctx = m5_context(df5, s); ctx.update(s=s, htf=htf, atr=m15["atr"], adx=m15["adx"])
+    return ctx
+
+async def open_trade(bot, s, entry, ctx):
+    state["count"] += 1
+    t = build_trade(s, entry, ctx["atr"], {"htf": ctx["htf"], "adx": ctx["adx"]})
+    state["trade"] = t; state["armed"] = None
+    await send(bot, format_entry(t))
+    log.info("ENTRÉE %s %s SL %s TP %s", t["dir"], t["entry"], t["sl"], t["tp"])
+
+async def monitor_trade(bot):
+    t = state["trade"]
+    df5 = closed(await get_candles("5min", 40))
+    if df5 is None: return
+    bars = df5[df5["time"] >= pd.Timestamp(t["opened"]).tz_localize(None).floor("5min")]
+    why = check_exit(t, bars)
+    if why is None:
+        age = (now_utc() - t["opened"]).total_seconds()
+        n = now_utc()
+        if age > MAX_HOLD_SEC: why = "ferme-le au prix du marché (24 h)"
+        elif n.weekday() == 4 and n.hour >= 20 and n.minute >= 30: why = "ferme-le avant le week-end"
+    if why:
+        await send(bot, format_result(t, why))
+        state["trade"] = None
+
+async def rebond_cycle(bot):
+    """Matin : cherche une bougie de rejet de l'EMA20 M5 dans la tendance M15."""
+    if state["count_reb"] >= REB_MAX_DAY: return
+    slot = int(time.time() // 900)
+    m15, s15 = _cache["m15"]
+    if m15 is None or s15 != slot:
+        m15 = m15_state(closed(await get_candles("15min", 200)))
+        _cache["m15"] = (m15, slot)
+    if m15 is None: return
+    trend = 1 if m15["ef"] > m15["es"] else (-1 if m15["ef"] < m15["es"] else 0)
+    s, a5 = rebond_signal(closed(await get_candles("5min", 80)), trend)
+    if not s: return
+    live = await get_live_price()
+    if live is None: return
+    state["count_reb"] += 1
+    t = build_trade(s, live, None, {"strat": "REBOND", "tp_first_bar": True},
+                    sl_dist=REB_SL_ATR * a5, tp_dist=REB_TP_ATR * a5)
+    state["trade"] = t
+    await send(bot, format_entry(t))
+    log.info("REBOND %s %s SL %s TP %s", t["dir"], t["entry"], t["sl"], t["tp"])
+
+async def cycle(bot):
+    """Appelé 20 s après chaque clôture M5."""
+    reset_daily()
+    if state["trade"]:
+        await monitor_trade(bot)
+        if state["trade"]: return
+    n = now_utc(); bar_start = n - pd.Timedelta(minutes=5, seconds=SCAN_OFFSET_SEC)
+    if n.weekday() < 5 and REB_START_UTC <= bar_start.hour < REB_END_UTC:
+        await rebond_cycle(bot); return
+    if not in_session() or in_news_blackout() or state["count"] >= MAX_TRADES_DAY:
+        state["armed"] = None; return
+
+    ctx = await get_context()
+    if ctx is None: return
+
+    # Touche ratée entre deux vérifications pendant la bougie qui vient de fermer
+    prev = state["armed"]
+    if prev and prev["s"] == ctx["s"]:
+        touched = (prev["s"] < 0 and ctx["last_high"] >= prev["ema_next"]) or (prev["s"] > 0 and ctx["last_low"] <= prev["ema_next"])
+        if touched:
+            live = await get_live_price()
+            if live is not None and abs(live - prev["ema_next"]) <= MISSED_TOUCH_ATR * ctx["atr"]:
+                await open_trade(bot, ctx["s"], live, ctx); return
+    state["armed"] = None
+
+    if not ctx["away_ok"]: return
+    state["armed"] = {"s": ctx["s"], "ema_next": ctx["ema_next"]}
+
+    near = abs(ctx["last_close"] - ctx["ema_next"]) <= POLL_NEAR_ATR * ctx["atr"]
+    if not near or state["credits"] >= CREDIT_BUDGET: return
+    while seconds_to_next_m5() > POLL_SEC + 5:
+        await asyncio.sleep(POLL_SEC)
+        live = await get_live_price()
+        entry = touch_entry(ctx["s"], ctx["ema_next"], live)
+        if entry is not None:
+            await open_trade(bot, ctx["s"], entry, ctx); return
 
 async def main():
-    bot = Bot(token=TELEGRAM_TOKEN,
-              request=HTTPXRequest(read_timeout=30, connect_timeout=30, write_timeout=30))
-    for attempt in range(5):
+    bot = Bot(token=TELEGRAM_TOKEN, request=HTTPXRequest(read_timeout=30, connect_timeout=30, write_timeout=30))
+    for _ in range(5):
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=(
-                "🚀 XauBot Signal v23.3 démarré\n\n"
-                f"🎯 Mode d'entrée : {ENTRY_MODE}\n"
-                "📊 M30 → tendance | M15 → setup | M5 → entrée\n\n"
-                "✅ Nouveau v23.3 :\n"
-                "• Scan à chaque clôture M5 (+20 s)\n"
-                "• SNIPER : 🟡 SETUP puis 🎯 ENTRE MAINTENANT sur pullback M5\n"
-                "• SL serré derrière le pullback, mêmes TP\n"
-                "• Prix live + alerte TROP TARD\n"
-                "• Ordres limit désactivés\n"
-                f"🎯 Score minimum : {MIN_CONFIDENCE}/100"
-            ))
+                "🚀 XauBot Signal v25 REBOND + TENDANCE démarré\n\n"
+                f"☀️ {REB_START_UTC}h-{REB_END_UTC}h UTC (8h-13h Paris) : REBOND sur l'EMA20 M5\n"
+                f"   TP {REB_TP_ATR} ATR M5 | SL {REB_SL_ATR} ATR M5 | max {REB_MAX_DAY}/jour\n"
+                f"🌙 {SESSION_START_UTC}h-{SESSION_END_UTC}h UTC (13h-21h Paris) : TENDANCE NY\n"
+                f"   SL {SL_ATR} ATR M15 | TP unique {TP_R} R | max {MAX_TRADES_DAY}/jour\n"
+                "🔒 1 seul trade à la fois\n"
+                f"📦 Lot conseillé dans chaque signal (risque {int(RISK_EUR)} €)\n"
+                "✅/❌ Le bot t'annonce le résultat de chaque trade\n"
+                "⚠️ Signaux uniquement — aucun ordre automatique"))
             break
         except Exception as e:
-            log.error("Startup: %s", e)
-            await asyncio.sleep(10)
-
-    log.info("XauBot v23.3 démarré (mode %s)", ENTRY_MODE)
-
+            log.error("Startup: %s", e); await asyncio.sleep(10)
+    log.info("XauBot v25 démarré")
     while True:
         await asyncio.sleep(seconds_to_next_m5())
         try:
-            if not is_market_open():
-                if pending["signal"]:
-                    await send(bot, f"⌛ SETUP {pending['signal']['direction']} EXPIRÉ — marché fermé")
-                    pending["signal"] = None
-                log.info("Marché fermé")
-                continue
-
-            if in_news_blackout():
-                log.info("Fenêtre news / ouverture NY : pas de scan")
-                continue
-
-            # 1) Un setup attend son entrée → on surveille seulement le M5
-            if pending["signal"]:
-                await manage_pending(bot)
-                continue
-
-            # 2) Recherche d'un nouveau setup (logique v23.2 inchangée)
-            signal = await analyze_xauusd()
-            if not (signal and should_send_signal(signal)):
-                continue
-
-            last_signal["XAUUSD"] = {"direction": signal["direction"],
-                                      "price": signal["price"], "ts": time.time()}
-
-            if ENTRY_MODE == "SNIPER":
-                await send(bot, format_setup_message(signal))
-                pending["signal"] = signal
-                pending["candles_left"] = ENTRY_WINDOW_M5
-            else:
-                live = await get_live_price(XAUUSD_CONFIG["symbol"])
-                await send(bot, format_direct_message(signal, live))
-
-            if SEND_LIMIT:
-                limit = calc_limit_entry(signal)
-                if limit:
-                    sell_rejected = False
-                    if signal["direction"] == "SELL":
-                        df5 = signal.get("m5_df5")
-                        if df5 is not None:
-                            sell_rejected = check_zone_rejection(df5, limit["limit"], "SELL")
-                    limit_msg = format_limit_message(signal, limit, sell_rejected)
-                    if limit_msg:
-                        await asyncio.sleep(2)
-                        await send(bot, limit_msg)
-
+            await cycle(bot)
         except Exception as e:
-            log.exception("Erreur principale: %s", e)
+            log.exception("Erreur cycle: %s", e)
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     asyncio.run(main())
